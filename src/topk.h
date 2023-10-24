@@ -5,6 +5,7 @@
 #include <cuda.h>
 #include <chrono>
 #include <thread>
+#include <numeric>
 #include "omp.h"
 
 #define DEBUG

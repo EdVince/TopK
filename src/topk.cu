@@ -65,6 +65,7 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     uint16_t *d_doc_lens = nullptr;
     uint16_t *d_query = nullptr;
 
+    // cuda第一次启动要创建context，很慢且无法避免
 
     std::chrono::high_resolution_clock::time_point t1 = std::chrono::high_resolution_clock::now();
 
@@ -72,8 +73,6 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     uint16_t *h_docs;
     std::thread convert_format([&]() {
         std::chrono::high_resolution_clock::time_point d1 = std::chrono::high_resolution_clock::now();
-        // h_docs = new uint16_t[MAX_DOC_SIZE * n_docs];
-        // memset(h_docs, 0, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs);
         h_docs = (uint16_t*)calloc(MAX_DOC_SIZE*n_docs,sizeof(uint16_t));
         #pragma omp parallel for
         for (int i = 0; i < lens.size(); i++) {
@@ -138,14 +137,37 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
         cudaMemcpy(scores.data(), d_scores, sizeof(float) * n_docs, cudaMemcpyDeviceToHost);
         // sort scores
         sort_thread = std::thread([&]() {
-            for (int i = 0; i < n_docs; ++i) s_indices[i] = i;
-            std::partial_sort(s_indices.begin(), s_indices.begin() + TOPK, s_indices.end(),
+            // 初始下标
+            std::iota(s_indices.begin(), s_indices.end(), 0);
+            // 多线程分块topk排序
+            const int NUM_THREADS = 8;
+            int chunk_size = s_indices.size() / NUM_THREADS;
+            std::vector<std::thread> threads;
+            std::vector<int> merged_results(NUM_THREADS * TOPK);
+            for (int i = 0; i < NUM_THREADS; ++i) {
+                threads.emplace_back([&s_indices, &scores, chunk_size, i, &merged_results]() {
+                    int start = i * chunk_size;
+                    int end = (i == NUM_THREADS - 1) ? s_indices.size() : start + chunk_size;
+                    std::partial_sort(s_indices.begin() + start, s_indices.begin() + start + TOPK, s_indices.begin() + end,
+                                    [&scores](const int& a, const int& b) {
+                                        if (scores[a] != scores[b])
+                                            return scores[a] > scores[b];  // 按照分数降序排序
+                                        return a < b;  // 如果分数相同，按索引从小到大排序
+                                    });
+                    std::copy(s_indices.begin() + start, s_indices.begin() + start + TOPK, merged_results.begin() + i * TOPK);
+                });
+            }
+            for (auto& thread : threads) {
+                thread.join();
+            }
+            // 合并块topk排序
+            std::partial_sort(merged_results.begin(), merged_results.begin() + TOPK, merged_results.end(),
                             [&scores](const int& a, const int& b) {
                                 if (scores[a] != scores[b])
                                     return scores[a] > scores[b];  // 按照分数降序排序
                                 return a < b;  // 如果分数相同，按索引从小到大排序
                             });
-            std::vector<int> s_ans(s_indices.begin(), s_indices.begin() + TOPK);
+            std::vector<int> s_ans(merged_results.begin(), merged_results.begin() + TOPK);
             indices.push_back(s_ans);
         });
     }
@@ -162,5 +184,4 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     std::chrono::high_resolution_clock::time_point t3 = std::chrono::high_resolution_clock::now();
     std::cout << "[CUDA] preprocess: " << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << " ms " << std::endl;
     std::cout << "[CUDA] process: " << std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count() << " ms " << std::endl;
-
 }
