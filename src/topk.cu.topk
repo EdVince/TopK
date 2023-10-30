@@ -1,0 +1,422 @@
+#include "topk.h"
+
+typedef uint4 group_t; // uint32_t
+
+void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(
+        const __restrict__ uint16_t *docs, 
+        const uint16_t *doc_lens, const size_t n_docs, 
+        uint16_t *query, const int query_len, float *scores) {
+    // each thread process one doc-query pair scoring task
+    register auto tid = blockIdx.x * blockDim.x + threadIdx.x, tnum = gridDim.x * blockDim.x;
+
+    if (tid >= n_docs) {
+        return;
+    }
+
+    __shared__ uint16_t query_on_shm[MAX_QUERY_SIZE];
+#pragma unroll
+    for (auto i = threadIdx.x; i < query_len; i += blockDim.x) {
+        query_on_shm[i] = query[i]; // not very efficient query loading temporally, as assuming its not hotspot
+    }
+
+    __syncthreads();
+
+    for (auto doc_id = tid; doc_id < n_docs; doc_id += tnum) {
+        register int query_idx = 0;
+
+        register float tmp_score = 0.;
+
+        register bool no_more_load = false;
+
+        for (auto i = 0; i < MAX_DOC_SIZE / (sizeof(group_t) / sizeof(uint16_t)); i++) {
+            if (no_more_load) {
+                break;
+            }
+            register group_t loaded = ((group_t *)docs)[i * n_docs + doc_id]; // tid
+            register uint16_t *doc_segment = (uint16_t*)(&loaded);
+            for (auto j = 0; j < sizeof(group_t) / sizeof(uint16_t); j++) {
+                if (doc_segment[j] == 0) {
+                    no_more_load = true;
+                    break;
+                }
+                while (query_idx < query_len && query_on_shm[query_idx] < doc_segment[j]) {
+                    ++query_idx;
+                }
+                if (query_idx < query_len) {
+                    tmp_score += (query_on_shm[query_idx] == doc_segment[j]);
+                }
+            }
+            // __syncwarp();
+        }
+        scores[doc_id] = 100.0 * tmp_score / max(query_len, doc_lens[doc_id]); // tid
+    }
+}
+
+#define DSIZE 8000000
+#define nTPB 256
+#define MAX_BLOCKS ((DSIZE/nTPB)+1)
+#define FLOAT_MIN -1.0f
+
+__device__ volatile float blk_vals[MAX_BLOCKS];
+__device__ volatile int   blk_idxs[MAX_BLOCKS];
+__device__ int   blk_num = 0;
+
+__global__ void clearBlkNum() {
+    blk_num = 0;
+}
+
+template <typename T>
+__global__ void max_idx_kernel(const T *data, const int dsize, int *result){
+
+  __shared__ volatile T   vals[nTPB];
+  __shared__ volatile int idxs[nTPB];
+  __shared__ volatile int last_block;
+  int idx = threadIdx.x+blockDim.x*blockIdx.x;
+  last_block = 0;
+  T   my_val = FLOAT_MIN;
+  int my_idx = -1;
+  // sweep from global memory
+  while (idx < dsize){
+    if (data[idx] > my_val) {my_val = data[idx]; my_idx = idx;}
+    idx += blockDim.x*gridDim.x;}
+  // populate shared memory
+  vals[threadIdx.x] = my_val;
+  idxs[threadIdx.x] = my_idx;
+  __syncthreads();
+  // sweep in shared memory
+  for (int i = (nTPB>>1); i > 0; i>>=1){
+    if (threadIdx.x < i)
+      if (vals[threadIdx.x] < vals[threadIdx.x + i]) {vals[threadIdx.x] = vals[threadIdx.x+i]; idxs[threadIdx.x] = idxs[threadIdx.x+i]; }
+    __syncthreads();}
+  // perform block-level reduction
+  if (!threadIdx.x){
+    blk_vals[blockIdx.x] = vals[0];
+    blk_idxs[blockIdx.x] = idxs[0];
+    if (atomicAdd(&blk_num, 1) == gridDim.x - 1) // then I am the last block
+      last_block = 1;}
+  __syncthreads();
+  if (last_block){
+    idx = threadIdx.x;
+    my_val = FLOAT_MIN;
+    my_idx = -1;
+    while (idx < gridDim.x){
+      if (blk_vals[idx] > my_val) {my_val = blk_vals[idx]; my_idx = blk_idxs[idx]; }
+      idx += blockDim.x;}
+  // populate shared memory
+    vals[threadIdx.x] = my_val;
+    idxs[threadIdx.x] = my_idx;
+    __syncthreads();
+  // sweep in shared memory
+    for (int i = (nTPB>>1); i > 0; i>>=1){
+      if (threadIdx.x < i)
+        if (vals[threadIdx.x] < vals[threadIdx.x + i]) {vals[threadIdx.x] = vals[threadIdx.x+i]; idxs[threadIdx.x] = idxs[threadIdx.x+i]; }
+      __syncthreads();}
+    if (!threadIdx.x)
+      *result = idxs[0];
+    }
+}
+
+void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
+    std::vector<std::vector<uint16_t>> &docs,
+    std::vector<uint16_t> &lens,
+    std::vector<std::vector<int>> &indices //shape [querys.size(), TOPK]
+    ) {
+
+    auto n_docs = docs.size();
+    float* scores[2] = {nullptr,nullptr};
+    float *d_scores[2] = {nullptr,nullptr};
+    uint16_t *d_docs = nullptr;
+    uint16_t *d_doc_lens = nullptr;
+    uint16_t *d_query = nullptr;
+
+    // cuda第一次启动要创建context，很慢且无法避免
+
+    std::chrono::high_resolution_clock::time_point t1 = std::chrono::high_resolution_clock::now();
+
+    // 子线程
+    uint16_t *h_docs;
+    std::thread convert_format([&]() {
+        std::chrono::high_resolution_clock::time_point d1 = std::chrono::high_resolution_clock::now();
+        h_docs = (uint16_t*)calloc(MAX_DOC_SIZE*n_docs,sizeof(uint16_t));
+        #pragma omp parallel for
+        for (int i = 0; i < lens.size(); i++) {
+            for (int j = 0; j < lens[i]; j++) {
+                auto group_sz = sizeof(group_t) / sizeof(uint16_t);
+                auto layer_0_offset = j / group_sz;
+                auto layer_0_stride = n_docs * group_sz;
+                auto layer_1_offset = i;
+                auto layer_1_stride = group_sz;
+                auto layer_2_offset = j % group_sz;
+                auto final_offset = layer_0_offset * layer_0_stride + layer_1_offset * layer_1_stride + layer_2_offset;
+                h_docs[final_offset] = docs[i][j];
+            }
+        }
+
+        cudaMalloc(&d_doc_lens, sizeof(uint16_t) * n_docs);
+        cudaMalloc(&d_query, sizeof(uint16_t) * MAX_QUERY_SIZE);
+        cudaMalloc(&d_scores[0], sizeof(float) * n_docs);
+        cudaMalloc(&d_scores[1], sizeof(float) * n_docs);
+        cudaMemcpy(d_doc_lens, lens.data(), sizeof(uint16_t) * n_docs, cudaMemcpyHostToDevice);
+
+        std::chrono::high_resolution_clock::time_point d2 = std::chrono::high_resolution_clock::now();
+        std::cout << "[CUDA] convert: " << std::chrono::duration_cast<std::chrono::milliseconds>(d2 - d1).count() << " ms " << std::endl;
+    });
+
+    // 主线程
+    std::chrono::high_resolution_clock::time_point d1 = std::chrono::high_resolution_clock::now();
+    cudaMallocHost(&scores[0], n_docs * sizeof(float));
+    cudaMallocHost(&scores[1], n_docs * sizeof(float));
+    std::vector<int> s_indices(n_docs);
+    cudaMalloc(&d_docs, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs);
+    std::chrono::high_resolution_clock::time_point d2 = std::chrono::high_resolution_clock::now();
+    std::cout << "[CUDA] malloc: " << std::chrono::duration_cast<std::chrono::milliseconds>(d2 - d1).count() << " ms " << std::endl;
+
+    convert_format.join();
+
+    // 非常耗时
+    cudaMemcpy(d_docs, h_docs, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs, cudaMemcpyHostToDevice);
+
+    cudaDeviceProp device_props;
+    cudaGetDeviceProperties(&device_props, 0);
+    cudaSetDevice(0);
+
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+
+    int *d_max_index;
+    cudaMalloc(&d_max_index, sizeof(int));
+
+
+    std::chrono::high_resolution_clock::time_point t2 = std::chrono::high_resolution_clock::now();
+    bool step = false;
+    for(auto& query : querys) {
+
+        // host-to-device
+        const size_t query_len = query.size();
+        cudaMemcpy(d_query, query.data(), sizeof(uint16_t) * query_len, cudaMemcpyHostToDevice);
+        // launch kernel
+        int block = N_THREADS_IN_ONE_BLOCK;
+        int grid = (n_docs + block - 1) / block;
+        docQueryScoringCoalescedMemoryAccessSampleKernel<<<grid, block>>>(d_docs, d_doc_lens, n_docs, d_query, query_len, d_scores[step]);
+        cudaDeviceSynchronize();
+
+
+        cudaMemcpy(scores[step], d_scores[step], sizeof(float) * n_docs, cudaMemcpyDeviceToHost);
+        float* cur_scores = scores[step];
+
+
+        // float* d_topk_value = nullptr;
+        // int64_t* d_topk_index = nullptr;
+        // cudaMalloc(&d_topk_value, sizeof(float) * 100);
+        // cudaMalloc(&d_topk_index, sizeof(int64_t) * 100);
+
+        // std::chrono::high_resolution_clock::time_point d1 = std::chrono::high_resolution_clock::now();
+        // RadixTopK<float, true><<<1, 1024, 256*sizeof(uint32_t)>>>(
+        //         d_scores[step],
+        //         100,
+        //         1,
+        //         1000000,
+        //         d_topk_value,
+        //         d_topk_index);
+        // cudaDeviceSynchronize();
+
+        // std::chrono::high_resolution_clock::time_point d2 = std::chrono::high_resolution_clock::now();
+        // std::cout << "[CUDA] RadixTopK: " << std::chrono::duration_cast<std::chrono::milliseconds>(d2 - d1).count() << " ms " << std::endl;
+
+        // std::vector<int64_t> topk_index(100);
+        // cudaMemcpy(topk_index.data(), d_topk_index, sizeof(int64_t) * 100, cudaMemcpyDeviceToHost);
+        // std::sort(topk_index.begin(), topk_index.end(),
+        //                 [&cur_scores](const int64_t& a, const int64_t& b) {
+        //                     if (cur_scores[a] != cur_scores[b])
+        //                         return cur_scores[a] > cur_scores[b];  // 按照分数降序排序
+        //                     return a < b;  // 如果分数相同，按索引从小到大排序
+        //                 });
+        // std::cout<<"0:"<<topk_index[0]<<","<<topk_index[topk_index.size()-1]<<std::endl;
+
+
+        // thrust::device_vector<float> device_vec(d_scores[step], d_scores[step]+n_docs);
+        // std::chrono::high_resolution_clock::time_point d1 = std::chrono::high_resolution_clock::now();
+        // thrust::device_vector<float>::iterator iter;
+        // for(int i = 0; i < 100; i++) {
+        //     iter = thrust::max_element(device_vec.begin(), device_vec.end());
+        //     int max_index = iter - device_vec.begin();
+        //     device_vec[max_index] = 0;
+        // }
+        // std::chrono::high_resolution_clock::time_point d2 = std::chrono::high_resolution_clock::now();
+        // std::cout << "[CUDA] TopK: " << std::chrono::duration_cast<std::chrono::milliseconds>(d2 - d1).count() << " ms " << std::endl;
+        // int max_index = iter - device_vec.begin();        
+        // std::cout<<"0:"<<max_index<<std::endl;
+
+        // int max_index = 0;
+        // thrust::device_ptr<float> dev_ptr = thrust::device_pointer_cast(d_scores[step]);
+        // std::chrono::high_resolution_clock::time_point d1 = std::chrono::high_resolution_clock::now();
+        // for(int i = 0; i < 100; i++) {
+        //     thrust::device_ptr<float> max_ptr = thrust::max_element(dev_ptr, dev_ptr+n_docs);
+        //     max_index = max_ptr-dev_ptr;
+        //     dev_ptr[max_index] = 0;
+        // }
+        // std::chrono::high_resolution_clock::time_point d2 = std::chrono::high_resolution_clock::now();
+        // std::cout << "[CUDA] TopK: " << std::chrono::duration_cast<std::chrono::milliseconds>(d2 - d1).count() << " ms " << std::endl;
+        // std::cout<<"0:"<<max_index<<std::endl;
+
+
+        // float new_value = 0.0f;
+        // int max_index;
+        // std::chrono::high_resolution_clock::time_point d1 = std::chrono::high_resolution_clock::now();
+        // for (int i = 0; i < 100; i++) {
+        //     cublasIsamax(handle, n_docs, d_scores[step], 1, &max_index);
+        //     max_index -= 1;
+        //     cudaMemcpy(&d_scores[step][max_index], &new_value, sizeof(float), cudaMemcpyHostToDevice);
+        // }
+        // std::chrono::high_resolution_clock::time_point d2 = std::chrono::high_resolution_clock::now();
+        // std::cout << "[CUDA] TopK: " << std::chrono::duration_cast<std::chrono::milliseconds>(d2 - d1).count() << " ms " << std::endl;
+        // std::cout<<"0:"<<max_index<<std::endl;
+
+        std::chrono::high_resolution_clock::time_point d1 = std::chrono::high_resolution_clock::now();
+        int blocks = 1024;
+        int blocksize = n_docs / blocks;
+        int start = 0, len = blocksize;
+        int max_index;
+        float max_value;
+
+        struct BlockInfo {
+            int32_t block_id;
+            int32_t block_start;
+            int32_t block_len;
+            int32_t max_index;
+            float max_value;
+        };
+
+        // std::vector<BlockInfo> max_record;
+        auto comparator = [](const BlockInfo& a, const BlockInfo& b) {
+            if (a.max_value != b.max_value)
+                return a.max_value < b.max_value;
+            return a.block_id > b.block_id;
+        };
+        std::priority_queue<BlockInfo, std::vector<BlockInfo>, decltype(comparator)> max_record(comparator);
+
+
+        std::chrono::high_resolution_clock::time_point o1 = std::chrono::high_resolution_clock::now();
+        max_idx_kernel<float><<<((n_docs+nTPB-1)/nTPB), nTPB>>>(d_scores[step], n_docs, d_max_index);
+        cudaDeviceSynchronize();
+        std::chrono::high_resolution_clock::time_point o2 = std::chrono::high_resolution_clock::now();
+        std::cout << "[CUDA] test: " << std::chrono::duration_cast<std::chrono::milliseconds>(o2 - o1).count() << " ms " << std::endl;
+
+
+
+
+
+        // 初始化
+        for(int i = 0; i < blocks; i++) {
+            if (i == blocks-1)
+              len += n_docs - blocks * blocksize;
+
+
+            cublasIsamax(handle, len, d_scores[step] + start, 1, &max_index);
+
+            // clearBlkNum<<<1,1>>>();
+            // cudaDeviceSynchronize();
+            // max_idx_kernel<float><<<((len+nTPB-1)/nTPB), nTPB>>>(d_scores[step]+start, len, d_max_index);
+            // cudaDeviceSynchronize();
+            // cudaMemcpy(&max_index, d_max_index, sizeof(int), cudaMemcpyDeviceToHost);
+            // max_index += 1;
+
+            cudaMemcpy(&max_value, d_scores[step] + start + max_index - 1, sizeof(float), cudaMemcpyDeviceToHost);
+            BlockInfo info;
+            info.block_id = i;
+            info.block_start = start;
+            info.block_len = len;
+            info.max_index = start+max_index-1;
+            info.max_value = max_value;
+            // max_record.push_back(info);
+            max_record.push(info);
+            start += len;
+        }
+        // std::sort(max_record.begin(), max_record.end(), 
+        //           [](const BlockInfo& a, const BlockInfo& b) {
+        //                 if (a.max_value != b.max_value)
+        //                   return a.max_value < b.max_value;
+        //                 return a.block_id > b.block_id;});
+        
+        std::chrono::high_resolution_clock::time_point d2 = std::chrono::high_resolution_clock::now();
+
+        std::vector<int> topk;
+        float zero_value = 0.0f;
+        // 开始计算topk
+        for (int i = 0; i < 100; i++) {
+          // topk.push_back(max_record[blocks-1].max_index);
+          // cudaMemcpy(&d_scores[step][max_record[blocks-1].max_index], &zero_value, sizeof(float), cudaMemcpyHostToDevice);
+          // cublasIsamax(handle, max_record[blocks-1].block_len, d_scores[step]+max_record[blocks-1].block_start, 1, &max_index);
+          // cudaMemcpy(&max_value, d_scores[step]+max_record[blocks-1].block_start+max_index-1, sizeof(float), cudaMemcpyDeviceToHost);
+          // max_record[blocks-1].max_index = max_record[blocks-1].block_start+max_index-1;
+          // max_record[blocks-1].max_value = max_value;
+          // std::sort(max_record.begin(), max_record.end(), 
+          //           [](const BlockInfo& a, const BlockInfo& b) {
+          //                 if (a.max_value != b.max_value)
+          //                   return a.max_value < b.max_value;
+          //                 return a.block_id > b.block_id;});
+          BlockInfo max_info = max_record.top();
+          max_record.pop();
+          topk.push_back(max_info.max_index);
+          cudaMemcpy(&d_scores[step][max_info.max_index], &zero_value, sizeof(float), cudaMemcpyHostToDevice);
+
+        //   cublasIsamax(handle, max_info.block_len, d_scores[step]+max_info.block_start, 1, &max_index);
+
+            cublasIsamax(handle, len, d_scores[step] + start, 1, &max_index);
+            clearBlkNum<<<1,1>>>();
+            cudaDeviceSynchronize();
+            max_idx_kernel<float><<<((max_info.block_len+nTPB-1)/nTPB), nTPB>>>(d_scores[step]+max_info.block_start, max_info.block_len, d_max_index);
+            cudaDeviceSynchronize();
+            cudaMemcpy(&max_index, d_max_index, sizeof(int), cudaMemcpyDeviceToHost);
+            max_index += 1;
+
+
+          cudaMemcpy(&max_value, d_scores[step]+max_info.block_start+max_index-1, sizeof(float), cudaMemcpyDeviceToHost);
+          max_info.max_index = max_info.block_start+max_index-1;
+          max_info.max_value = max_value;
+          max_record.push(max_info);
+        }
+
+
+        std::chrono::high_resolution_clock::time_point d3 = std::chrono::high_resolution_clock::now();
+        std::cout << "[CUDA] pre-TopK: " << std::chrono::duration_cast<std::chrono::milliseconds>(d2 - d1).count() << " ms " << std::endl;
+        std::cout << "[CUDA] TopK: " << std::chrono::duration_cast<std::chrono::milliseconds>(d3 - d1).count() << " ms " << std::endl;
+        
+        std::cout<<"0:"<<topk[99]<<std::endl;
+
+
+
+
+        
+        // sort scores
+        for (int i = 0; i < n_docs; ++i) s_indices[i] = i;
+        std::partial_sort(s_indices.begin(), s_indices.begin() + TOPK, s_indices.end(),
+                        [&cur_scores](const int& a, const int& b) {
+                            if (cur_scores[a] != cur_scores[b])
+                                return cur_scores[a] > cur_scores[b];  // 按照分数降序排序
+                            return a < b;  // 如果分数相同，按索引从小到大排序
+                        });
+        std::vector<int> s_ans(s_indices.begin(), s_indices.begin() + TOPK);
+        std::cout<<"1:"<<s_ans[99]<<std::endl;
+        indices.push_back(s_ans);
+
+        break;
+    }
+    
+    cublasDestroy(handle);
+
+    // deallocation
+    cudaFree(d_max_index);
+    cudaFree(d_docs);
+    cudaFree(d_query);
+    cudaFree(d_scores[0]);
+    cudaFree(d_scores[1]);
+    cudaFree(d_doc_lens);
+    free(h_docs);
+    cudaFreeHost(scores[0]);
+    cudaFreeHost(scores[1]);
+
+    std::chrono::high_resolution_clock::time_point t3 = std::chrono::high_resolution_clock::now();
+    std::cout << "[CUDA] preprocess: " << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << " ms " << std::endl;
+    std::cout << "[CUDA] process: " << std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count() << " ms " << std::endl;
+}

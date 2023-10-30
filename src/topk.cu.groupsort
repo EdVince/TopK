@@ -5,22 +5,33 @@ typedef uint4 group_t; // uint32_t
 void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(
         const __restrict__ uint16_t *docs, 
         const uint16_t *doc_lens, const size_t n_docs, 
-        uint16_t *query, const int query_len, int16_t *scores, uint8_t *dict) {
+        uint16_t *query, const int query_len, float *scores) {
+    // each thread process one doc-query pair scoring task
     register auto tid = blockIdx.x * blockDim.x + threadIdx.x, tnum = gridDim.x * blockDim.x;
-    if (tid >= n_docs)
-        return;
 
+    if (tid >= n_docs) {
+        return;
+    }
+
+    __shared__ uint16_t query_on_shm[MAX_QUERY_SIZE];
 #pragma unroll
     for (auto i = threadIdx.x; i < query_len; i += blockDim.x) {
-        dict[query[i]] = 1;
+        query_on_shm[i] = query[i]; // not very efficient query loading temporally, as assuming its not hotspot
     }
+
     __syncthreads();
 
     for (auto doc_id = tid; doc_id < n_docs; doc_id += tnum) {
-        register uint32_t tmp_score = 0.;
+        register int query_idx = 0;
+
+        register float tmp_score = 0.;
+
         register bool no_more_load = false;
+
         for (auto i = 0; i < MAX_DOC_SIZE / (sizeof(group_t) / sizeof(uint16_t)); i++) {
-            if (no_more_load) break;
+            if (no_more_load) {
+                break;
+            }
             register group_t loaded = ((group_t *)docs)[i * n_docs + doc_id]; // tid
             register uint16_t *doc_segment = (uint16_t*)(&loaded);
             for (auto j = 0; j < sizeof(group_t) / sizeof(uint16_t); j++) {
@@ -28,21 +39,24 @@ void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(
                     no_more_load = true;
                     break;
                 }
-                if (dict[doc_segment[j]]) {
-                    tmp_score += 1;
+                while (query_idx < query_len && query_on_shm[query_idx] < doc_segment[j]) {
+                    ++query_idx;
+                }
+                if (query_idx < query_len) {
+                    tmp_score += (query_on_shm[query_idx] == doc_segment[j]);
                 }
             }
-            __syncwarp();
+            // __syncwarp();
         }
-        scores[doc_id] = 16384 * tmp_score / max(query_len, doc_lens[doc_id]); // tid
+        scores[doc_id] = tmp_score / max(query_len, doc_lens[doc_id]); // tid
     }
 }
 
-void __global__ groupArgMax(const int16_t *scores, const int32_t size, int32_t* max_idx) {
+void __global__ groupArgMax(const float *scores, const int32_t size, int32_t* max_idx) {
     auto tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= size)
         return;
-    register int32_t _max_val = -1;
+    register float _max_val = -1.0f;
     register int32_t _max_idx = -1;
     for(auto i = 0; i < 512; i++) {
         if(scores[tid*512+i] > _max_val) {
@@ -56,7 +70,7 @@ void __global__ groupArgMax(const int16_t *scores, const int32_t size, int32_t* 
 struct BlockInfo {
     int32_t block_id;
     int32_t max_index;
-    int32_t max_value;
+    float max_value;
 };
 
 void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
@@ -70,14 +84,13 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     for(int i = 0; i < (n_docs-docs.size()); i++)
         lens.emplace_back();
 
-    int16_t* scores[2] = {nullptr,nullptr};
-    int16_t* d_scores[2] = {nullptr,nullptr};
-    uint16_t* d_docs = nullptr;
-    uint16_t* d_doc_lens = nullptr;
-    uint16_t* d_query = nullptr;
+    float* scores[2] = {nullptr,nullptr};
+    float *d_scores[2] = {nullptr,nullptr};
+    uint16_t *d_docs = nullptr;
+    uint16_t *d_doc_lens = nullptr;
+    uint16_t *d_query = nullptr;
     int32_t* d_group_max_index[2] = {nullptr,nullptr};
     int32_t* group_max_index = nullptr;
-    uint8_t* dict = nullptr;
 
     cudaStream_t kernelStream, memcpyStream;
 
@@ -115,9 +128,8 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
 
         cudaMalloc(&d_doc_lens, sizeof(uint16_t) * n_docs);
         cudaMalloc(&d_query, sizeof(uint16_t) * MAX_QUERY_SIZE);
-        cudaMalloc(&d_scores[0], sizeof(int16_t) * n_docs);
-        cudaMalloc(&d_scores[1], sizeof(int16_t) * n_docs);
-        cudaMalloc(&dict, sizeof(uint8_t) * 50000);
+        cudaMalloc(&d_scores[0], sizeof(float) * n_docs);
+        cudaMalloc(&d_scores[1], sizeof(float) * n_docs);
         cudaMemcpy(d_doc_lens, lens.data(), sizeof(uint16_t) * n_docs, cudaMemcpyHostToDevice);
 
         std::chrono::high_resolution_clock::time_point d2 = std::chrono::high_resolution_clock::now();
@@ -126,8 +138,8 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
 
     // 主线程
     std::chrono::high_resolution_clock::time_point d1 = std::chrono::high_resolution_clock::now();
-    cudaMallocHost(&scores[0], n_docs * sizeof(int16_t));
-    cudaMallocHost(&scores[1], n_docs * sizeof(int16_t));
+    cudaMallocHost(&scores[0], n_docs * sizeof(float));
+    cudaMallocHost(&scores[1], n_docs * sizeof(float));
     cudaMallocHost(&group_max_index, group_max_block_num * sizeof(int32_t));
     cudaMalloc(&d_group_max_index[0], group_max_block_num * sizeof(int32_t));
     cudaMalloc(&d_group_max_index[1], group_max_block_num * sizeof(int32_t));
@@ -152,15 +164,13 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     std::thread sort_thread;
     for(auto& query : querys) {
 
-        cudaMemset(dict, 0, sizeof(uint8_t) * 50000);
-
         // host-to-device
         const size_t query_len = query.size();
         cudaMemcpy(d_query, query.data(), sizeof(uint16_t) * query_len, cudaMemcpyHostToDevice);
         // launch kernel
         int block = N_THREADS_IN_ONE_BLOCK;
         int grid = (n_docs + block - 1) / block;
-        docQueryScoringCoalescedMemoryAccessSampleKernel<<<grid, block, 0, kernelStream>>>(d_docs, d_doc_lens, n_docs, d_query, query_len, d_scores[step], dict);
+        docQueryScoringCoalescedMemoryAccessSampleKernel<<<grid, block, 0, kernelStream>>>(d_docs, d_doc_lens, n_docs, d_query, query_len, d_scores[step]);
         // cudaDeviceSynchronize();
         cudaStreamSynchronize(kernelStream);
         groupArgMax<<<group_max_block_num/512+1,512,0,kernelStream>>>(d_scores[step],n_docs,d_group_max_index[step]);
@@ -175,11 +185,11 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
         // sort scores
         if (needWait) {
             sort_thread = std::thread([&](int cur_step) {
-                cudaMemcpyAsync(scores[cur_step], d_scores[cur_step], sizeof(int16_t) * n_docs, cudaMemcpyDeviceToHost, memcpyStream);
+                cudaMemcpyAsync(scores[cur_step], d_scores[cur_step], sizeof(float) * n_docs, cudaMemcpyDeviceToHost, memcpyStream);
                 cudaStreamSynchronize(memcpyStream);
                 cudaMemcpyAsync(group_max_index, d_group_max_index[cur_step], group_max_block_num * sizeof(int32_t), cudaMemcpyDeviceToHost, memcpyStream);
                 cudaStreamSynchronize(memcpyStream);
-                int16_t* cur_scores = scores[cur_step];
+                float* cur_scores = scores[cur_step];
                 std::priority_queue<BlockInfo, std::vector<BlockInfo>, decltype(comparator)> max_record(comparator);
                 for(int i = 0; i < group_max_block_num; i++)
                     max_record.push({i,group_max_index[i]+i*512,cur_scores[group_max_index[i]+i*512]});
@@ -188,7 +198,7 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
                     BlockInfo max_info = max_record.top();
                     max_record.pop();
                     topk[i] = max_info.max_index;
-                    cur_scores[max_info.max_index] = -1; // 一定要清到小于0，不然会跟原始的0值发生冲突
+                    cur_scores[max_info.max_index] = -1.0f; // 一定要清到小于0，不然会跟原始的0值发生冲突
                     int max_index = std::max_element(cur_scores+max_info.block_id*512, cur_scores+max_info.block_id*512+512) - (cur_scores+max_info.block_id*512);
                     max_info.max_index = max_index+max_info.block_id*512;
                     max_info.max_value = cur_scores[max_info.block_id*512+max_index];
@@ -205,7 +215,6 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     sort_thread.join();
 
     // deallocation
-    cudaFree(dict);
     cudaFree(d_docs);
     cudaFree(d_query);
     cudaFree(d_scores[0]);

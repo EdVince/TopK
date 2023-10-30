@@ -7,6 +7,22 @@
 #include <thread>
 #include <numeric>
 #include "omp.h"
+#include <thrust/host_vector.h>
+#include <thrust/device_vector.h>
+#include <thrust/sort.h>
+#include <thrust/extrema.h>
+#include <thrust/reduce.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/functional.h>
+#include "cub/cub.cuh"
+#include "cub/util_type.cuh"
+#include "cub/util_allocator.cuh"
+#include "cub/device/device_radix_sort.cuh"
+#include <limits>
+#include <cublas_v2.h>
+#include <queue>
+#include <random>
+#include <unordered_map>
 
 #define DEBUG
 
