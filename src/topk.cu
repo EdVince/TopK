@@ -10,9 +10,14 @@ void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(
     if (tid >= n_docs)
         return;
 
-#pragma unroll
-    for (auto i = threadIdx.x; i < query_len; i += blockDim.x) {
-        dict[query[i]] = 1;
+// #pragma unroll
+    // for (auto i = threadIdx.x; i < query_len; i += blockDim.x) {
+    //     dict[query[i]/8] += 1<<(query[i]%8);
+    // }
+    if (threadIdx.x == 0) {
+        for (auto i = 0; i < query_len; i++) {
+            dict[query[i]/8] |= 1<<(query[i]%8);
+        }
     }
     __syncthreads();
 
@@ -28,7 +33,7 @@ void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(
                     no_more_load = true;
                     break;
                 }
-                if (dict[doc_segment[j]]) {
+                if ((dict[doc_segment[j]/8] >> (doc_segment[j]%8)) & 1) {
                     tmp_score += 1;
                 }
             }
@@ -117,7 +122,7 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
         cudaMalloc(&d_query, sizeof(uint16_t) * MAX_QUERY_SIZE);
         cudaMalloc(&d_scores[0], sizeof(int16_t) * n_docs);
         cudaMalloc(&d_scores[1], sizeof(int16_t) * n_docs);
-        cudaMalloc(&dict, sizeof(uint8_t) * 50000);
+        cudaMalloc(&dict, sizeof(uint8_t) * 6250);
         cudaMemcpy(d_doc_lens, lens.data(), sizeof(uint16_t) * n_docs, cudaMemcpyHostToDevice);
 
         std::chrono::high_resolution_clock::time_point d2 = std::chrono::high_resolution_clock::now();
@@ -152,7 +157,7 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     std::thread sort_thread;
     for(auto& query : querys) {
 
-        cudaMemset(dict, 0, sizeof(uint8_t) * 50000);
+        cudaMemset(dict, 0, sizeof(uint8_t) * 6250);
 
         // host-to-device
         const size_t query_len = query.size();
@@ -219,7 +224,6 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     cudaFreeHost(group_max_index);
     cudaStreamDestroy(kernelStream);
     cudaStreamDestroy(memcpyStream);
-
 
     std::chrono::high_resolution_clock::time_point t3 = std::chrono::high_resolution_clock::now();
     std::cout << "[CUDA] preprocess: " << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << " ms " << std::endl;
