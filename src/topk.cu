@@ -1,28 +1,259 @@
 #include "topk.h"
+#include "ThreadPool.h"
+
+// https://github.com/facebookincubator/AITemplate/blob/ab1cfbcefcfe9639255a7ed8a2ff4bb522ebf61e/python/aitemplate/backend/common/tensor/topk_common.py
+const int32_t kThreadsNumPerBlock = 256;
+const int32_t kMaxBlocksNum = 8192;
+
+#define GPU_KERNEL_LOOP(i, n)                                 \
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < (n); \
+       i += blockDim.x * gridDim.x)
+
+inline size_t GetAlignedSize(size_t size) {
+  const size_t kAlignSize = 512;
+  return (size + kAlignSize - 1) / kAlignSize * kAlignSize;
+}
+
+class MultiplyFunctor final {
+ public:
+  MultiplyFunctor(int32_t num_col) : num_col_(num_col) {}
+  __host__ __device__ __forceinline__ int32_t operator()(int32_t idx) const {
+    return idx * num_col_;
+  }
+
+ private:
+  int32_t num_col_;
+};
+
+template <typename KeyType, typename ValueType>
+size_t InferTempStorageForSortPairsDescending(
+    int32_t num_row,
+    int32_t num_col) {
+  using SegmentOffsetIter = cub::TransformInputIterator<
+      int32_t,
+      MultiplyFunctor,
+      cub::CountingInputIterator<int32_t>>;
+
+  cub::CountingInputIterator<int32_t> counting_iter(0);
+  MultiplyFunctor multiply_functor(num_col);
+  SegmentOffsetIter segment_offset_iter(counting_iter, multiply_functor);
+
+  size_t temp_storage_bytes = 0;
+  auto err = cub::DeviceSegmentedRadixSort::
+      SortPairsDescending<KeyType, ValueType, SegmentOffsetIter>(
+          /* d_temp_storage */ nullptr,
+          /* temp_storage_bytes */ temp_storage_bytes,
+          /* d_keys_in */ nullptr,
+          /* d_keys_out */ nullptr,
+          /* d_values_in */ nullptr,
+          /* d_values_out */ nullptr,
+          /* num_items */ num_row * num_col,
+          /* num_segments */ num_row,
+          /* d_begin_offsets */ segment_offset_iter,
+          /* d_end_offsets */ segment_offset_iter + 1,
+          /* begin_bit */ 0,
+          /* end_bit */ sizeof(KeyType) * 8,
+          /* stream */ 0);
+
+  return temp_storage_bytes;
+}
+
+template <typename KeyType, typename ValueType>
+void SortPairsDescending(
+    const KeyType* keys_ptr,
+    const ValueType* values_ptr,
+    int32_t num_row,
+    int32_t num_col,
+    void* temp_storage_ptr,
+    int32_t temp_storage_bytes,
+    KeyType* sorted_keys_ptr,
+    ValueType* sorted_values_ptr,
+    cudaStream_t stream) {
+  size_t rt_inferred_temp_storage_bytes =
+      InferTempStorageForSortPairsDescending<KeyType, ValueType>(
+          num_row, num_col);
+
+  using SegmentOffsetIter = cub::TransformInputIterator<
+      int32_t,
+      MultiplyFunctor,
+      cub::CountingInputIterator<int32_t>>;
+
+  cub::CountingInputIterator<int32_t> counting_iter(0);
+  MultiplyFunctor multiply_functor(num_col);
+  SegmentOffsetIter segment_offset_iter(counting_iter, multiply_functor);
+
+  auto err = cub::DeviceSegmentedRadixSort::SortPairsDescending(
+      /* d_temp_storage */ temp_storage_ptr,
+      /* temp_storage_bytes */ rt_inferred_temp_storage_bytes,
+      /* d_keys_in */ keys_ptr,
+      /* d_keys_out */ sorted_keys_ptr,
+      /* d_values_in */ values_ptr,
+      /* d_values_out */ sorted_values_ptr,
+      /* num_items */ num_row * num_col,
+      /* num_segments */ num_row,
+      /* d_begin_offsets */ segment_offset_iter,
+      /* d_end_offsets */ segment_offset_iter + 1,
+      /* begin_bit */ 0,
+      /* end_bit */ sizeof(KeyType) * 8,
+      /* stream */ stream);
+}
+
+template <typename T>
+class TmpBufferManager final {
+ public:
+  TmpBufferManager(int32_t capacity, void* ptr, const int32_t N)
+      : capacity_{capacity},
+        sorted_in_elem_cnt_{N},
+        indices_elem_cnt_{sorted_in_elem_cnt_},
+        sorted_indices_elem_cnt_{sorted_in_elem_cnt_} {
+    const int32_t sorted_in_aligned_bytes =
+        GetAlignedSize(sorted_in_elem_cnt_ * sizeof(T));
+    const int32_t indices_aligned_bytes =
+        GetAlignedSize(indices_elem_cnt_ * sizeof(int32_t));
+    const int32_t sorted_indices_aligned_bytes = indices_aligned_bytes;
+    sorted_in_ptr_ = reinterpret_cast<T*>(ptr);
+    indices_ptr_ = reinterpret_cast<int32_t*>(
+        reinterpret_cast<char*>(sorted_in_ptr_) + sorted_in_aligned_bytes);
+    sorted_indices_ptr_ = reinterpret_cast<int32_t*>(
+        reinterpret_cast<char*>(indices_ptr_) + indices_aligned_bytes);
+    temp_storage_ptr_ = reinterpret_cast<void*>(
+        reinterpret_cast<char*>(sorted_indices_ptr_) +
+        sorted_indices_aligned_bytes);
+    temp_storage_bytes_ = capacity_ - sorted_in_aligned_bytes -
+        indices_aligned_bytes - sorted_indices_aligned_bytes;
+  }
+  ~TmpBufferManager() = default;
+
+  T* SortedInPtr() const {
+    return sorted_in_ptr_;
+  }
+  int32_t* IndicesPtr() const {
+    return indices_ptr_;
+  }
+  int32_t* SortedIndicesPtr() const {
+    return sorted_indices_ptr_;
+  }
+  void* TempStoragePtr() const {
+    return temp_storage_ptr_;
+  }
+
+  int32_t TempStorageBytes() const {
+    return temp_storage_bytes_;
+  }
+
+ private:
+  int32_t capacity_;
+
+  T* sorted_in_ptr_;
+  int32_t* indices_ptr_;
+  int32_t* sorted_indices_ptr_;
+  void* temp_storage_ptr_;
+
+  int32_t sorted_in_elem_cnt_;
+  int32_t indices_elem_cnt_;
+  int32_t sorted_indices_elem_cnt_;
+  int32_t temp_storage_bytes_;
+};
+
+__global__ void InitializeIndices(
+    int32_t elem_cnt,
+    int32_t* indices_ptr,
+    int32_t instance_size) {
+  GPU_KERNEL_LOOP(i, elem_cnt) {
+    indices_ptr[i] = i % instance_size;
+  };
+}
+
+// ALIGNPTR
+int32_t* alignPtr(int32_t* ptr, uintptr_t to) {
+  uintptr_t addr = (uintptr_t)ptr;
+  if (addr % to) {
+    addr += to - addr % to;
+  }
+  return (int32_t*)addr;
+}
+
+inline int32_t BlocksNum4ThreadsNum(const int32_t n) {
+  return std::min(
+      (n + kThreadsNumPerBlock - 1) / kThreadsNumPerBlock,
+      kMaxBlocksNum);
+}
+
+template <typename T>
+void topk_launcher(
+    cudaStream_t stream,
+    const int elem_cnt,
+    const int instance_size,
+    const int instance_num,
+    const int top_k,
+    const void* input,
+    void* workspace,
+    void* output_index,
+    void* output_value) {
+  const int32_t k = std::min(top_k, instance_size);
+  const uintptr_t ALIGNMENT = 32;
+  int32_t* vworkspace = alignPtr((int32_t*)workspace, ALIGNMENT);
+  T* tmp_buffer = (T*)vworkspace;
+
+  TmpBufferManager<T> buf_manager(
+      static_cast<int32_t>(elem_cnt), tmp_buffer, elem_cnt);
+
+  InitializeIndices<<<
+      BlocksNum4ThreadsNum(elem_cnt),
+      kThreadsNumPerBlock,
+      0,
+      stream>>>(elem_cnt, buf_manager.IndicesPtr(), instance_size);
+
+  SortPairsDescending(
+      (const T*)input,
+      buf_manager.IndicesPtr(),
+      instance_num,
+      instance_size,
+      buf_manager.TempStoragePtr(),
+      buf_manager.TempStorageBytes(),
+      buf_manager.SortedInPtr(),
+      buf_manager.SortedIndicesPtr(),
+      stream);
+
+  cudaMemcpy2DAsync(
+      (int32_t*)output_index,
+      k * sizeof(int32_t),
+      buf_manager.SortedIndicesPtr(),
+      instance_size * sizeof(int32_t),
+      k * sizeof(int32_t),
+      instance_num,
+      cudaMemcpyDefault,
+      stream);
+
+  cudaMemcpy2DAsync(
+      (T*)output_value,
+      k * sizeof(T),
+      buf_manager.SortedInPtr(),
+      instance_size * sizeof(T),
+      k * sizeof(T),
+      instance_num,
+      cudaMemcpyDefault,
+      stream);
+}
 
 typedef uint4 group_t; // uint32_t
 
 void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(
         const __restrict__ uint16_t *docs, 
         const uint16_t *doc_lens, const size_t n_docs, 
-        uint16_t *query, const int query_len, int16_t *scores, uint8_t *dict) {
+        uint16_t *query, const int query_len, uint16_t *scores, uint8_t *dict) {
     register auto tid = blockIdx.x * blockDim.x + threadIdx.x, tnum = gridDim.x * blockDim.x;
     if (tid >= n_docs)
         return;
 
-// #pragma unroll
-    // for (auto i = threadIdx.x; i < query_len; i += blockDim.x) {
-    //     dict[query[i]/8] += 1<<(query[i]%8);
-    // }
-    if (threadIdx.x == 0) {
-        for (auto i = 0; i < query_len; i++) {
-            dict[query[i]/8] |= 1<<(query[i]%8);
-        }
+#pragma unroll
+    for (auto i = threadIdx.x; i < query_len; i += blockDim.x) {
+        dict[query[i]] = 1;
     }
     __syncthreads();
 
     for (auto doc_id = tid; doc_id < n_docs; doc_id += tnum) {
-        register uint32_t tmp_score = 0.;
+        register int32_t tmp_score = 0.;
         register bool no_more_load = false;
         for (auto i = 0; i < MAX_DOC_SIZE / (sizeof(group_t) / sizeof(uint16_t)); i++) {
             if (no_more_load) break;
@@ -33,36 +264,15 @@ void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(
                     no_more_load = true;
                     break;
                 }
-                if ((dict[doc_segment[j]/8] >> (doc_segment[j]%8)) & 1) {
+                if (dict[doc_segment[j]]) {
                     tmp_score += 1;
                 }
             }
             __syncwarp();
         }
-        scores[doc_id] = 16384 * tmp_score / max(query_len, doc_lens[doc_id]); // tid
+        scores[doc_id] = 16384 * tmp_score / max(query_len, doc_lens[doc_id]);
     }
 }
-
-void __global__ groupArgMax(const int16_t *scores, const int32_t size, int32_t* max_idx) {
-    auto tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= size)
-        return;
-    register int32_t _max_val = -1;
-    register int32_t _max_idx = -1;
-    for(auto i = 0; i < 512; i++) {
-        if(scores[tid*512+i] > _max_val) {
-            _max_val = scores[tid*512+i];
-            _max_idx = i;
-        }
-    }
-    max_idx[tid] = _max_idx;
-}
-
-struct BlockInfo {
-    int32_t block_id;
-    int32_t max_index;
-    int32_t max_value;
-};
 
 void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     std::vector<std::vector<uint16_t>> &docs,
@@ -70,32 +280,22 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     std::vector<std::vector<int>> &indices //shape [querys.size(), TOPK]
     ) {
 
+    int grouptopk_size = 8192;
     int n_docs = docs.size();
-    n_docs = ((n_docs - 1) / 512 + 1) * 512;
+    n_docs = ((n_docs - 1) / grouptopk_size + 1) * grouptopk_size;
     for(int i = 0; i < (n_docs-docs.size()); i++)
         lens.emplace_back();
+    int grouptopk_batch = n_docs / grouptopk_size;
 
-    int16_t* scores[2] = {nullptr,nullptr};
-    int16_t* d_scores[2] = {nullptr,nullptr};
+    uint16_t* scores = nullptr;
+    uint16_t* d_scores = nullptr;
     uint16_t* d_docs = nullptr;
     uint16_t* d_doc_lens = nullptr;
     uint16_t* d_query = nullptr;
-    int32_t* d_group_max_index[2] = {nullptr,nullptr};
-    int32_t* group_max_index = nullptr;
     uint8_t* dict = nullptr;
-
-    cudaStream_t kernelStream, memcpyStream;
-
-    int group_max_block_size = 512;
-    int group_max_block_num = n_docs / group_max_block_size;
-
-    auto comparator = [](const BlockInfo& a, const BlockInfo& b) {
-        if (a.max_value != b.max_value)
-            return a.max_value < b.max_value;
-        return a.max_index > b.max_index;
-    };
-
-    // cuda第一次启动要创建context，很慢且无法避免
+    uint16_t* grouptopk_val = nullptr;
+    int32_t* grouptopk_idx = nullptr;
+    int32_t* grouptopk_workspace = nullptr;
 
     std::chrono::high_resolution_clock::time_point t1 = std::chrono::high_resolution_clock::now();
 
@@ -120,25 +320,22 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
 
         cudaMalloc(&d_doc_lens, sizeof(uint16_t) * n_docs);
         cudaMalloc(&d_query, sizeof(uint16_t) * MAX_QUERY_SIZE);
-        cudaMalloc(&d_scores[0], sizeof(int16_t) * n_docs);
-        cudaMalloc(&d_scores[1], sizeof(int16_t) * n_docs);
-        cudaMalloc(&dict, sizeof(uint8_t) * 6250);
+        cudaMalloc(&d_scores, sizeof(uint16_t) * n_docs);
+        cudaMalloc(&dict, sizeof(uint8_t) * 50000);
         cudaMemcpy(d_doc_lens, lens.data(), sizeof(uint16_t) * n_docs, cudaMemcpyHostToDevice);
-
         std::chrono::high_resolution_clock::time_point d2 = std::chrono::high_resolution_clock::now();
         std::cout << "[CUDA] convert: " << std::chrono::duration_cast<std::chrono::milliseconds>(d2 - d1).count() << " ms " << std::endl;
     });
 
     // 主线程
     std::chrono::high_resolution_clock::time_point d1 = std::chrono::high_resolution_clock::now();
-    cudaMallocHost(&scores[0], n_docs * sizeof(int16_t));
-    cudaMallocHost(&scores[1], n_docs * sizeof(int16_t));
-    cudaMallocHost(&group_max_index, group_max_block_num * sizeof(int32_t));
-    cudaMalloc(&d_group_max_index[0], group_max_block_num * sizeof(int32_t));
-    cudaMalloc(&d_group_max_index[1], group_max_block_num * sizeof(int32_t));
-    cudaStreamCreate(&kernelStream);
-    cudaStreamCreate(&memcpyStream);
     cudaMalloc(&d_docs, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs);
+    cudaMalloc(&grouptopk_workspace, n_docs * (TOPK+5) * sizeof(int32_t));
+    cudaMallocHost(&scores, n_docs * sizeof(uint16_t));
+    cudaMallocHost(&grouptopk_val, grouptopk_size * TOPK * sizeof(uint16_t));
+    cudaMallocHost(&grouptopk_idx, grouptopk_size * TOPK * sizeof(int32_t));
+    ThreadPool pool(1);
+    auto result = pool.enqueue([&](){});
     std::chrono::high_resolution_clock::time_point d2 = std::chrono::high_resolution_clock::now();
     std::cout << "[CUDA] malloc: " << std::chrono::duration_cast<std::chrono::milliseconds>(d2 - d1).count() << " ms " << std::endl;
 
@@ -152,12 +349,8 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     cudaSetDevice(0);
 
     std::chrono::high_resolution_clock::time_point t2 = std::chrono::high_resolution_clock::now();
-    bool step = 0;
     bool needWait = false;
-    std::thread sort_thread;
     for(auto& query : querys) {
-
-        cudaMemset(dict, 0, sizeof(uint8_t) * 6250);
 
         // host-to-device
         const size_t query_len = query.size();
@@ -165,66 +358,57 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
         // launch kernel
         int block = N_THREADS_IN_ONE_BLOCK;
         int grid = (n_docs + block - 1) / block;
-        docQueryScoringCoalescedMemoryAccessSampleKernel<<<grid, block, 0, kernelStream>>>(d_docs, d_doc_lens, n_docs, d_query, query_len, d_scores[step], dict);
-        // cudaDeviceSynchronize();
-        cudaStreamSynchronize(kernelStream);
-        groupArgMax<<<group_max_block_num/512+1,512,0,kernelStream>>>(d_scores[step],n_docs,d_group_max_index[step]);
-        cudaStreamSynchronize(kernelStream);
+        cudaMemset(dict, 0, sizeof(uint8_t) * 50000);
+        docQueryScoringCoalescedMemoryAccessSampleKernel<<<grid, block>>>(d_docs, d_doc_lens, n_docs, d_query, query_len, d_scores, dict);
+        cudaDeviceSynchronize();
 
-        if (needWait) {
-            sort_thread.join();
-        }
-        else
-            needWait = true;
+        if (needWait) result.wait();
+        else needWait = true;
 
-        // sort scores
-        if (needWait) {
-            sort_thread = std::thread([&](int cur_step) {
-                cudaMemcpyAsync(scores[cur_step], d_scores[cur_step], sizeof(int16_t) * n_docs, cudaMemcpyDeviceToHost, memcpyStream);
-                cudaStreamSynchronize(memcpyStream);
-                cudaMemcpyAsync(group_max_index, d_group_max_index[cur_step], group_max_block_num * sizeof(int32_t), cudaMemcpyDeviceToHost, memcpyStream);
-                cudaStreamSynchronize(memcpyStream);
-                int16_t* cur_scores = scores[cur_step];
-                std::priority_queue<BlockInfo, std::vector<BlockInfo>, decltype(comparator)> max_record(comparator);
-                for(int i = 0; i < group_max_block_num; i++)
-                    max_record.push({i,group_max_index[i]+i*512,cur_scores[group_max_index[i]+i*512]});
-                std::vector<int> topk(TOPK);
-                for(int i = 0; i < TOPK; i++) {
-                    BlockInfo max_info = max_record.top();
-                    max_record.pop();
-                    topk[i] = max_info.max_index;
-                    cur_scores[max_info.max_index] = -1; // 一定要清到小于0，不然会跟原始的0值发生冲突
-                    int max_index = std::max_element(cur_scores+max_info.block_id*512, cur_scores+max_info.block_id*512+512) - (cur_scores+max_info.block_id*512);
-                    max_info.max_index = max_index+max_info.block_id*512;
-                    max_info.max_value = cur_scores[max_info.block_id*512+max_index];
-                    max_record.push(max_info);
+        // std::chrono::high_resolution_clock::time_point d1 = std::chrono::high_resolution_clock::now();
+        // launch topk
+        topk_launcher<uint16_t>(0,
+            n_docs,           // elem_cnt
+            grouptopk_size,   // instance_size
+            grouptopk_batch,  // instance_num
+            TOPK,             // top_k
+            d_scores,grouptopk_workspace,grouptopk_idx,grouptopk_val);
+        cudaDeviceSynchronize();
+
+        result = pool.enqueue([&]() {
+            std::vector<int> top(grouptopk_batch,0);
+            std::vector<int> topk(TOPK);
+            for (int i = 0; i < TOPK; i++) {
+                int idx = -1;
+                int16_t val = -1;
+                for (int j = 0; j < grouptopk_batch; j++) {
+                    if (grouptopk_val[j*TOPK+top[j]] > val) {
+                        val = grouptopk_val[j*TOPK+top[j]];
+                        idx = grouptopk_idx[j*TOPK+top[j]] + j*grouptopk_size;
+                    }
                 }
-                indices.push_back(topk); // 存储结果
-            }, step);
-            // sort_thread.join();
-        }
-
-        step = !step;
+                topk[i] = idx;
+                top[idx/grouptopk_size]++;
+            }
+            indices.push_back(topk);
+        });
+        // std::chrono::high_resolution_clock::time_point d2 = std::chrono::high_resolution_clock::now();
+        // std::cout << "[topk] " << std::chrono::duration_cast<std::chrono::microseconds>(d2 - d1).count() << " us " << std::endl;
     }
-
-    sort_thread.join();
 
     // deallocation
     cudaFree(dict);
     cudaFree(d_docs);
     cudaFree(d_query);
-    cudaFree(d_scores[0]);
-    cudaFree(d_scores[1]);
+    cudaFree(d_scores);
     cudaFree(d_doc_lens);
-    cudaFree(d_group_max_index[0]);
-    cudaFree(d_group_max_index[1]);
+    cudaFreeHost(scores);
+    result.wait();
+    cudaFreeHost(grouptopk_val);
+    cudaFreeHost(grouptopk_idx);
+    cudaFree(grouptopk_workspace);
     free(h_docs);
-    cudaFreeHost(scores[0]);
-    cudaFreeHost(scores[1]);
-    cudaFreeHost(group_max_index);
-    cudaStreamDestroy(kernelStream);
-    cudaStreamDestroy(memcpyStream);
-
+    
     std::chrono::high_resolution_clock::time_point t3 = std::chrono::high_resolution_clock::now();
     std::cout << "[CUDA] preprocess: " << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << " ms " << std::endl;
     std::cout << "[CUDA] process: " << std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count() << " ms " << std::endl;
