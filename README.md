@@ -18,6 +18,7 @@
 5. 0.00041分：用双stream把kernel和memcpy给overlap起来，总的是kernel、memcpy、sort三个overlap
 6. 0.00045分(最高0.0005分)：kernel用超大数组做哈希map，score量化到uint16_t减少io开销
 7. 0.0005分：哈希数组压缩到8bit，提高访存效率
+8. 9.22509分：全局CUDA预分配，cub的topk算法
 
 ## CPU优化(不算分)
 1. 多线程分块读取大txt文件
