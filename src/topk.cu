@@ -280,7 +280,7 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     std::vector<std::vector<int>> &indices //shape [querys.size(), TOPK]
     ) {
 
-    int grouptopk_size = 8192;
+    int grouptopk_size = 16384;
     int n_docs = docs.size();
     n_docs = ((n_docs - 1) / grouptopk_size + 1) * grouptopk_size;
     for(int i = 0; i < (n_docs-docs.size()); i++)
@@ -296,6 +296,13 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     uint16_t* grouptopk_val = nullptr;
     int32_t* grouptopk_idx = nullptr;
     int32_t* grouptopk_workspace = nullptr;
+
+    std::chrono::high_resolution_clock::time_point h1, h2;
+    int64_t mallocT = 0;
+    int64_t convertT = 0;
+    int64_t kernelT = 0;
+    int64_t topkT = 0;
+    int64_t cpuT = 0;
 
     std::chrono::high_resolution_clock::time_point t1 = std::chrono::high_resolution_clock::now();
 
@@ -324,20 +331,18 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
         cudaMalloc(&dict, sizeof(uint8_t) * 50000);
         cudaMemcpy(d_doc_lens, lens.data(), sizeof(uint16_t) * n_docs, cudaMemcpyHostToDevice);
         std::chrono::high_resolution_clock::time_point d2 = std::chrono::high_resolution_clock::now();
-        std::cout << "[CUDA] convert: " << std::chrono::duration_cast<std::chrono::milliseconds>(d2 - d1).count() << " ms " << std::endl;
+        convertT = std::chrono::duration_cast<std::chrono::milliseconds>(d2 - d1).count();
     });
 
     // 主线程
-    std::chrono::high_resolution_clock::time_point d1 = std::chrono::high_resolution_clock::now();
+    h1 = std::chrono::high_resolution_clock::now();
     cudaMalloc(&d_docs, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs);
     cudaMalloc(&grouptopk_workspace, n_docs * (TOPK+5) * sizeof(int32_t));
     cudaMallocHost(&scores, n_docs * sizeof(uint16_t));
     cudaMallocHost(&grouptopk_val, grouptopk_size * TOPK * sizeof(uint16_t));
     cudaMallocHost(&grouptopk_idx, grouptopk_size * TOPK * sizeof(int32_t));
-    ThreadPool pool(1);
-    auto result = pool.enqueue([&](){});
-    std::chrono::high_resolution_clock::time_point d2 = std::chrono::high_resolution_clock::now();
-    std::cout << "[CUDA] malloc: " << std::chrono::duration_cast<std::chrono::milliseconds>(d2 - d1).count() << " ms " << std::endl;
+    h2 = std::chrono::high_resolution_clock::now();
+    mallocT = std::chrono::duration_cast<std::chrono::milliseconds>(h2-h1).count();
 
     convert_format.join();
 
@@ -349,9 +354,9 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     cudaSetDevice(0);
 
     std::chrono::high_resolution_clock::time_point t2 = std::chrono::high_resolution_clock::now();
-    bool needWait = false;
     for(auto& query : querys) {
 
+        h1 = std::chrono::high_resolution_clock::now();
         // host-to-device
         const size_t query_len = query.size();
         cudaMemcpy(d_query, query.data(), sizeof(uint16_t) * query_len, cudaMemcpyHostToDevice);
@@ -361,12 +366,11 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
         cudaMemset(dict, 0, sizeof(uint8_t) * 50000);
         docQueryScoringCoalescedMemoryAccessSampleKernel<<<grid, block>>>(d_docs, d_doc_lens, n_docs, d_query, query_len, d_scores, dict);
         cudaDeviceSynchronize();
+        h2 = std::chrono::high_resolution_clock::now();
+        kernelT += std::chrono::duration_cast<std::chrono::microseconds>(h2-h1).count();
 
-        if (needWait) result.wait();
-        else needWait = true;
-
-        // std::chrono::high_resolution_clock::time_point d1 = std::chrono::high_resolution_clock::now();
         // launch topk
+        h1 = std::chrono::high_resolution_clock::now();
         topk_launcher<uint16_t>(0,
             n_docs,           // elem_cnt
             grouptopk_size,   // instance_size
@@ -374,42 +378,56 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
             TOPK,             // top_k
             d_scores,grouptopk_workspace,grouptopk_idx,grouptopk_val);
         cudaDeviceSynchronize();
+        h2 = std::chrono::high_resolution_clock::now();
+        topkT += std::chrono::duration_cast<std::chrono::microseconds>(h2-h1).count();
 
-        result = pool.enqueue([&]() {
-            std::vector<int> top(grouptopk_batch,0);
-            std::vector<int> topk(TOPK);
-            for (int i = 0; i < TOPK; i++) {
-                int idx = -1;
-                int16_t val = -1;
-                for (int j = 0; j < grouptopk_batch; j++) {
-                    if (grouptopk_val[j*TOPK+top[j]] > val) {
-                        val = grouptopk_val[j*TOPK+top[j]];
-                        idx = grouptopk_idx[j*TOPK+top[j]] + j*grouptopk_size;
-                    }
+        h1 = std::chrono::high_resolution_clock::now();
+        std::vector<int> top(grouptopk_batch,0);
+        std::vector<int> topk(TOPK);
+        for (int i = 0; i < TOPK; i++) {
+            int idx = -1;
+            int16_t val = -1;
+            for (int j = 0; j < grouptopk_batch; j++) {
+                if (grouptopk_val[j*TOPK+top[j]] > val) {
+                    val = grouptopk_val[j*TOPK+top[j]];
+                    idx = grouptopk_idx[j*TOPK+top[j]] + j*grouptopk_size;
                 }
-                topk[i] = idx;
-                top[idx/grouptopk_size]++;
             }
-            indices.push_back(topk);
-        });
-        // std::chrono::high_resolution_clock::time_point d2 = std::chrono::high_resolution_clock::now();
-        // std::cout << "[topk] " << std::chrono::duration_cast<std::chrono::microseconds>(d2 - d1).count() << " us " << std::endl;
+            topk[i] = idx;
+            top[idx/grouptopk_size]++;
+        }
+        h2 = std::chrono::high_resolution_clock::now();
+        cpuT += std::chrono::duration_cast<std::chrono::microseconds>(h2-h1).count();
+        indices.push_back(topk);
     }
 
+    std::chrono::high_resolution_clock::time_point t3 = std::chrono::high_resolution_clock::now();
+
     // deallocation
+    h1 = std::chrono::high_resolution_clock::now();
     cudaFree(dict);
     cudaFree(d_docs);
     cudaFree(d_query);
     cudaFree(d_scores);
     cudaFree(d_doc_lens);
     cudaFreeHost(scores);
-    result.wait();
     cudaFreeHost(grouptopk_val);
     cudaFreeHost(grouptopk_idx);
     cudaFree(grouptopk_workspace);
     free(h_docs);
+    h2 = std::chrono::high_resolution_clock::now();
     
-    std::chrono::high_resolution_clock::time_point t3 = std::chrono::high_resolution_clock::now();
-    std::cout << "[CUDA] preprocess: " << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << " ms " << std::endl;
-    std::cout << "[CUDA] process: " << std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count() << " ms " << std::endl;
+    int64_t releaseT = std::chrono::duration_cast<std::chrono::milliseconds>(h2-h1).count(); // 70~80ms
+    auto pret = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count(); // 预处理总时间
+    auto prot = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count(); // query总时间
+    float queryT = (float)prot / querys.size(); // 单次query时间us(<2ms)
+    kernelT = kernelT / querys.size(); // 单次kernel时间us(1000~1200us)
+    topkT = topkT / querys.size(); // 单次topk时间us(300~500us)
+    cpuT = cpuT / querys.size(); // 单次cpu时间us(<100us)
+    // convertT(1600~1700ms)
+    // mallocT(1800~1900ms)
+
+    printf("[TIME] preprocess time: %ldms, process time: %ldms, release time: %ldms\n",pret,prot,releaseT);
+    printf("[TIME] convert time: %ldms, malloc time: %ldms\n",convertT,mallocT);
+    printf("[TIME] query time: %.2fms, kernel time: %dus, topk time: %dus, cpu time: %dus\n",queryT,kernelT,topkT,cpuT);
 }
