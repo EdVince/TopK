@@ -283,17 +283,11 @@ void __global__ docQueryScoringCoalescedMemoryAccessSampleKernelBatch8(
 
 void __global__ docQueryScoringCoalescedMemoryAccessSampleKernelBatch1(
         const __restrict__ uint16_t *docs, const uint16_t *doc_lens, const size_t n_docs, 
-        uint16_t *query, const int query_len, 
+        const uint16_t query_len, 
         uint16_t *scores, uint8_t *dict) {
     register auto tid = blockIdx.x * blockDim.x + threadIdx.x, tnum = gridDim.x * blockDim.x;
     if (tid >= n_docs)
         return;
-
-#pragma unroll
-    for (auto i = threadIdx.x; i < query_len; i += blockDim.x) {
-        dict[query[i]] = 1;
-    }
-    __syncthreads();
 
     for (auto doc_id = tid; doc_id < n_docs; doc_id += tnum) {
         register int32_t tmp_score = 0.;
@@ -403,19 +397,56 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
         lens.emplace_back();
     int grouptopk_batch = n_docs / grouptopk_size;
 
-    #pragma omp parallel for
-    for (int i = 0; i < docs.size(); i++) {
-        for (int j = 0; j < lens[i]; j++) {
-            auto group_sz = sizeof(group_t) / sizeof(uint16_t);
-            auto layer_0_offset = j / group_sz;
-            auto layer_0_stride = n_docs * group_sz;
-            auto layer_1_offset = i;
-            auto layer_1_stride = group_sz;
-            auto layer_2_offset = j % group_sz;
-            auto final_offset = layer_0_offset * layer_0_stride + layer_1_offset * layer_1_stride + layer_2_offset;
-            cudaInit.h_docs[final_offset] = docs[i][j];
-        }
+    std::chrono::high_resolution_clock::time_point h1, h2;
+
+    int64_t cT = 0;
+    h1 = std::chrono::high_resolution_clock::now();
+    // #pragma omp parallel for
+    // for (int i = 0; i < docs.size(); i++) {
+    //     for (int j = 0; j < lens[i]; j++) {
+    //         auto group_sz = sizeof(group_t) / sizeof(uint16_t);
+    //         auto layer_0_offset = j / group_sz;
+    //         auto layer_0_stride = n_docs * group_sz;
+    //         auto layer_1_offset = i;
+    //         auto layer_1_stride = group_sz;
+    //         auto layer_2_offset = j % group_sz;
+    //         auto final_offset = layer_0_offset * layer_0_stride + layer_1_offset * layer_1_stride + layer_2_offset;
+    //         cudaInit.h_docs[final_offset] = std::move(docs[i][j]);
+    //     }
+    // }
+
+    int numThreads = omp_get_max_threads();
+    std::cout<<"max thread:"<<numThreads<<std::endl;
+    int docsSize = docs.size();
+    int docsPerThread = docsSize / numThreads;
+    std::vector<std::thread> threads;
+    for (int q = 0; q < numThreads; q++) {
+        auto start = q * docsPerThread;
+        auto end = start + docsPerThread;
+        if (q == numThreads-1) end = docsSize;
+        threads.emplace_back([&](int s, int e){
+            // std::chrono::high_resolution_clock::time_point d1 = std::chrono::high_resolution_clock::now();
+            for (int i = s; i < e; i++) {
+                for (int j = 0; j < lens[i]; j++) {
+                    auto group_sz = sizeof(group_t) / sizeof(uint16_t);
+                    auto layer_0_offset = j / group_sz;
+                    auto layer_0_stride = n_docs * group_sz;
+                    auto layer_1_offset = i;
+                    auto layer_1_stride = group_sz;
+                    auto layer_2_offset = j % group_sz;
+                    auto final_offset = layer_0_offset * layer_0_stride + layer_1_offset * layer_1_stride + layer_2_offset;
+                    cudaInit.h_docs[final_offset] = docs[i][j];
+                }
+            }
+            // std::chrono::high_resolution_clock::time_point d2 = std::chrono::high_resolution_clock::now();
+            // int64_t tt = std::chrono::duration_cast<std::chrono::milliseconds>(d2 - d1).count();
+            // std::cout<<tt<<std::endl;
+        },start,end);
     }
+    for (auto& thread : threads) thread.join();
+
+    h2 = std::chrono::high_resolution_clock::now();
+    cT = std::chrono::duration_cast<std::chrono::milliseconds>(h2 - h1).count();
 
     cudaMemcpy(cudaInit.d_doc_lens, lens.data(), sizeof(uint16_t) * n_docs, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaInit.d_docs, cudaInit.h_docs, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs, cudaMemcpyHostToDevice);
@@ -426,9 +457,6 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     int block = N_THREADS_IN_ONE_BLOCK;
     int grid = (n_docs + block - 1) / block;
     int cur_pos = 0;
-
-
-    std::chrono::high_resolution_clock::time_point h1, h2;
 
     double b8T = 0;
     h1 = std::chrono::high_resolution_clock::now();
@@ -485,11 +513,13 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
         auto& query = querys[cur_pos];
 
         const size_t query_len = query.size();
-        cudaMemcpy(cudaInit.d_query, query.data(), sizeof(uint16_t) * query_len, cudaMemcpyHostToDevice);
-        cudaMemset(cudaInit.d_dict, 0, sizeof(uint8_t) * 50000);
+        memset(cudaInit.h_dict, 0, sizeof(uint8_t) * 50000);
+        for(int i = 0; i < query_len; i++)
+            cudaInit.h_dict[query[i]] = 1;
+        cudaMemcpy(cudaInit.d_dict, cudaInit.h_dict, sizeof(uint8_t) * 50000, cudaMemcpyHostToDevice);
         docQueryScoringCoalescedMemoryAccessSampleKernelBatch1<<<grid, block>>>(
             cudaInit.d_docs, cudaInit.d_doc_lens, n_docs, 
-            cudaInit.d_query, query_len, 
+            query_len, 
             cudaInit.d_scores, cudaInit.d_dict);
         cudaDeviceSynchronize();
 
@@ -522,5 +552,6 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     h2 = std::chrono::high_resolution_clock::now();
     b1T = (double)std::chrono::duration_cast<std::chrono::milliseconds>(h2 - h1).count() / (querys.size()%8);
 
+    printf("[TIME] convert:%ldms\n",cT);
     printf("[TIME] Batch8:%.2lfms, Batch1:%.2lfms\n",b8T,b1T);
 }

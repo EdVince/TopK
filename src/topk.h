@@ -23,6 +23,8 @@
 #include <queue>
 #include <random>
 #include <unordered_map>
+#include <emmintrin.h>
+#include <immintrin.h>
 
 #define DEBUG
 
