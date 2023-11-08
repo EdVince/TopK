@@ -16,7 +16,11 @@
 7. 0.0005分：哈希数组压缩到8bit，提高访存效率
 8. 9.22509分：全局CUDA预分配，cub的topk算法
 9. 10.77255分：实现了batch8
-10. 17.56147分：convert从openmp换成了手动多线程
+10. 17.56147分(平均13.64522分)：convert从openmp换成了手动多线程
+```
+[TIME] convert:98ms, transfer:270ms
+[TIME] Batch8:1.75ms, Batch1:5.00ms
+```
 
 ## CPU优化(不算分)
 1. 多线程分块读取大txt文件

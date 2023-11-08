@@ -416,8 +416,12 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     h2 = std::chrono::high_resolution_clock::now();
     cT = std::chrono::duration_cast<std::chrono::milliseconds>(h2 - h1).count();
 
+    int64_t tT = 0;
+    h1 = std::chrono::high_resolution_clock::now();
     cudaMemcpy(cudaInit.d_doc_lens, lens.data(), sizeof(uint16_t) * n_docs, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaInit.d_docs, cudaInit.h_docs, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs, cudaMemcpyHostToDevice);
+    h2 = std::chrono::high_resolution_clock::now();
+    tT = std::chrono::duration_cast<std::chrono::milliseconds>(h2 - h1).count();
 
     cudaDeviceProp device_props;
     cudaGetDeviceProperties(&device_props, 0);
@@ -519,6 +523,6 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     h2 = std::chrono::high_resolution_clock::now();
     b1T = (double)std::chrono::duration_cast<std::chrono::milliseconds>(h2 - h1).count() / (querys.size()%8);
 
-    printf("[TIME] convert:%ldms\n",cT);
+    printf("[TIME] convert:%ldms, transfer:%ldms\n",cT,tT);
     printf("[TIME] Batch8:%.2lfms, Batch1:%.2lfms\n",b8T,b1T);
 }
