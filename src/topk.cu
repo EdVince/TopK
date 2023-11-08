@@ -1,61 +1,61 @@
 #include "topk.h"
+#include "cub/cub.cuh"
 
-// https://github.com/facebookincubator/AITemplate/blob/ab1cfbcefcfe9639255a7ed8a2ff4bb522ebf61e/python/aitemplate/backend/common/tensor/topk_common.py
 const int32_t kThreadsNumPerBlock = 256;
 const int32_t kMaxBlocksNum = 8192;
 const int32_t grouptopk_size = 16384;
 
 #define GPU_KERNEL_LOOP(i, n)                                 \
-  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < (n); \
-       i += blockDim.x * gridDim.x)
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < (n); \
+        i += blockDim.x * gridDim.x)
 
 inline size_t GetAlignedSize(size_t size) {
-  const size_t kAlignSize = 512;
-  return (size + kAlignSize - 1) / kAlignSize * kAlignSize;
+    const size_t kAlignSize = 512;
+    return (size + kAlignSize - 1) / kAlignSize * kAlignSize;
 }
 
 class MultiplyFunctor final {
- public:
-  MultiplyFunctor(int32_t num_col) : num_col_(num_col) {}
-  __host__ __device__ __forceinline__ int32_t operator()(int32_t idx) const {
-    return idx * num_col_;
-  }
+public:
+    MultiplyFunctor(int32_t num_col) : num_col_(num_col) {}
+    __host__ __device__ __forceinline__ int32_t operator()(int32_t idx) const {
+        return idx * num_col_;
+    }
 
- private:
-  int32_t num_col_;
+private:
+    int32_t num_col_;
 };
 
 template <typename KeyType, typename ValueType>
 size_t InferTempStorageForSortPairsDescending(
-    int32_t num_row,
-    int32_t num_col) {
-  using SegmentOffsetIter = cub::TransformInputIterator<
-      int32_t,
-      MultiplyFunctor,
-      cub::CountingInputIterator<int32_t>>;
+        int32_t num_row,
+        int32_t num_col) {
+    using SegmentOffsetIter = cub::TransformInputIterator<
+        int32_t,
+        MultiplyFunctor,
+        cub::CountingInputIterator<int32_t>>;
 
-  cub::CountingInputIterator<int32_t> counting_iter(0);
-  MultiplyFunctor multiply_functor(num_col);
-  SegmentOffsetIter segment_offset_iter(counting_iter, multiply_functor);
+    cub::CountingInputIterator<int32_t> counting_iter(0);
+    MultiplyFunctor multiply_functor(num_col);
+    SegmentOffsetIter segment_offset_iter(counting_iter, multiply_functor);
 
-  size_t temp_storage_bytes = 0;
-  auto err = cub::DeviceSegmentedRadixSort::
-      SortPairsDescending<KeyType, ValueType, SegmentOffsetIter>(
-          /* d_temp_storage */ nullptr,
-          /* temp_storage_bytes */ temp_storage_bytes,
-          /* d_keys_in */ nullptr,
-          /* d_keys_out */ nullptr,
-          /* d_values_in */ nullptr,
-          /* d_values_out */ nullptr,
-          /* num_items */ num_row * num_col,
-          /* num_segments */ num_row,
-          /* d_begin_offsets */ segment_offset_iter,
-          /* d_end_offsets */ segment_offset_iter + 1,
-          /* begin_bit */ 0,
-          /* end_bit */ sizeof(KeyType) * 8,
-          /* stream */ 0);
+    size_t temp_storage_bytes = 0;
+    auto err = cub::DeviceSegmentedRadixSort::
+        SortPairsDescending<KeyType, ValueType, SegmentOffsetIter>(
+            /* d_temp_storage */ nullptr,
+            /* temp_storage_bytes */ temp_storage_bytes,
+            /* d_keys_in */ nullptr,
+            /* d_keys_out */ nullptr,
+            /* d_values_in */ nullptr,
+            /* d_values_out */ nullptr,
+            /* num_items */ num_row * num_col,
+            /* num_segments */ num_row,
+            /* d_begin_offsets */ segment_offset_iter,
+            /* d_end_offsets */ segment_offset_iter + 1,
+            /* begin_bit */ 0,
+            /* end_bit */ sizeof(KeyType) * 8,
+            /* stream */ 0);
 
-  return temp_storage_bytes;
+    return temp_storage_bytes;
 }
 
 template <typename KeyType, typename ValueType>
@@ -69,39 +69,39 @@ void SortPairsDescending(
     KeyType* sorted_keys_ptr,
     ValueType* sorted_values_ptr,
     cudaStream_t stream) {
-  size_t rt_inferred_temp_storage_bytes =
-      InferTempStorageForSortPairsDescending<KeyType, ValueType>(
-          num_row, num_col);
+    size_t rt_inferred_temp_storage_bytes =
+        InferTempStorageForSortPairsDescending<KeyType, ValueType>(
+            num_row, num_col);
 
-  using SegmentOffsetIter = cub::TransformInputIterator<
-      int32_t,
-      MultiplyFunctor,
-      cub::CountingInputIterator<int32_t>>;
+    using SegmentOffsetIter = cub::TransformInputIterator<
+        int32_t,
+        MultiplyFunctor,
+        cub::CountingInputIterator<int32_t>>;
 
-  cub::CountingInputIterator<int32_t> counting_iter(0);
-  MultiplyFunctor multiply_functor(num_col);
-  SegmentOffsetIter segment_offset_iter(counting_iter, multiply_functor);
+    cub::CountingInputIterator<int32_t> counting_iter(0);
+    MultiplyFunctor multiply_functor(num_col);
+    SegmentOffsetIter segment_offset_iter(counting_iter, multiply_functor);
 
-  auto err = cub::DeviceSegmentedRadixSort::SortPairsDescending(
-      /* d_temp_storage */ temp_storage_ptr,
-      /* temp_storage_bytes */ rt_inferred_temp_storage_bytes,
-      /* d_keys_in */ keys_ptr,
-      /* d_keys_out */ sorted_keys_ptr,
-      /* d_values_in */ values_ptr,
-      /* d_values_out */ sorted_values_ptr,
-      /* num_items */ num_row * num_col,
-      /* num_segments */ num_row,
-      /* d_begin_offsets */ segment_offset_iter,
-      /* d_end_offsets */ segment_offset_iter + 1,
-      /* begin_bit */ 0,
-      /* end_bit */ sizeof(KeyType) * 8,
-      /* stream */ stream);
+    auto err = cub::DeviceSegmentedRadixSort::SortPairsDescending(
+        /* d_temp_storage */ temp_storage_ptr,
+        /* temp_storage_bytes */ rt_inferred_temp_storage_bytes,
+        /* d_keys_in */ keys_ptr,
+        /* d_keys_out */ sorted_keys_ptr,
+        /* d_values_in */ values_ptr,
+        /* d_values_out */ sorted_values_ptr,
+        /* num_items */ num_row * num_col,
+        /* num_segments */ num_row,
+        /* d_begin_offsets */ segment_offset_iter,
+        /* d_end_offsets */ segment_offset_iter + 1,
+        /* begin_bit */ 0,
+        /* end_bit */ sizeof(KeyType) * 8,
+        /* stream */ stream);
 }
 
 template <typename T>
 class TmpBufferManager final {
- public:
-  TmpBufferManager(int32_t capacity, void* ptr, const int32_t N)
+public:
+    TmpBufferManager(int32_t capacity, void* ptr, const int32_t N)
       : capacity_{capacity},
         sorted_in_elem_cnt_{N},
         indices_elem_cnt_{sorted_in_elem_cnt_},
@@ -121,62 +121,61 @@ class TmpBufferManager final {
         sorted_indices_aligned_bytes);
     temp_storage_bytes_ = capacity_ - sorted_in_aligned_bytes -
         indices_aligned_bytes - sorted_indices_aligned_bytes;
-  }
-  ~TmpBufferManager() = default;
+    }
+    ~TmpBufferManager() = default;
 
-  T* SortedInPtr() const {
-    return sorted_in_ptr_;
-  }
-  int32_t* IndicesPtr() const {
-    return indices_ptr_;
-  }
-  int32_t* SortedIndicesPtr() const {
-    return sorted_indices_ptr_;
-  }
-  void* TempStoragePtr() const {
-    return temp_storage_ptr_;
-  }
+    T* SortedInPtr() const {
+        return sorted_in_ptr_;
+    }
+    int32_t* IndicesPtr() const {
+        return indices_ptr_;
+    }
+    int32_t* SortedIndicesPtr() const {
+        return sorted_indices_ptr_;
+    }
+    void* TempStoragePtr() const {
+        return temp_storage_ptr_;
+    }
+    int32_t TempStorageBytes() const {
+        return temp_storage_bytes_;
+    }
 
-  int32_t TempStorageBytes() const {
-    return temp_storage_bytes_;
-  }
+private:
+    int32_t capacity_;
 
- private:
-  int32_t capacity_;
+    T* sorted_in_ptr_;
+    int32_t* indices_ptr_;
+    int32_t* sorted_indices_ptr_;
+    void* temp_storage_ptr_;
 
-  T* sorted_in_ptr_;
-  int32_t* indices_ptr_;
-  int32_t* sorted_indices_ptr_;
-  void* temp_storage_ptr_;
-
-  int32_t sorted_in_elem_cnt_;
-  int32_t indices_elem_cnt_;
-  int32_t sorted_indices_elem_cnt_;
-  int32_t temp_storage_bytes_;
+    int32_t sorted_in_elem_cnt_;
+    int32_t indices_elem_cnt_;
+    int32_t sorted_indices_elem_cnt_;
+    int32_t temp_storage_bytes_;
 };
 
 __global__ void InitializeIndices(
-    int32_t elem_cnt,
-    int32_t* indices_ptr,
-    int32_t instance_size) {
-  GPU_KERNEL_LOOP(i, elem_cnt) {
-    indices_ptr[i] = i % instance_size;
-  };
+        int32_t elem_cnt,
+        int32_t* indices_ptr,
+        int32_t instance_size) {
+    GPU_KERNEL_LOOP(i, elem_cnt) {
+        indices_ptr[i] = i % instance_size;
+    };
 }
 
 // ALIGNPTR
 int32_t* alignPtr(int32_t* ptr, uintptr_t to) {
-  uintptr_t addr = (uintptr_t)ptr;
-  if (addr % to) {
-    addr += to - addr % to;
-  }
-  return (int32_t*)addr;
+    uintptr_t addr = (uintptr_t)ptr;
+    if (addr % to) {
+        addr += to - addr % to;
+    }
+    return (int32_t*)addr;
 }
 
 inline int32_t BlocksNum4ThreadsNum(const int32_t n) {
-  return std::min(
-      (n + kThreadsNumPerBlock - 1) / kThreadsNumPerBlock,
-      kMaxBlocksNum);
+    return std::min(
+        (n + kThreadsNumPerBlock - 1) / kThreadsNumPerBlock,
+        kMaxBlocksNum);
 }
 
 template <typename T>
@@ -314,22 +313,17 @@ void __global__ docQueryScoringCoalescedMemoryAccessSampleKernelBatch1(
 class CUDAInit {
 public:
     CUDAInit(size_t N) {
-        std::cout<<"------------- CUDA Init -------------"<<std::endl;
         N = ((N - 1) / grouptopk_size + 1) * grouptopk_size;
-        std::chrono::high_resolution_clock::time_point t1 = std::chrono::high_resolution_clock::now();
 
         cudaFree(0);
 
         cudaMallocHost(&h_docs, sizeof(uint16_t) * MAX_DOC_SIZE * N);
-        cudaMallocHost(&h_querys, sizeof(uint16_t) * MAX_QUERY_SIZE * 8);
         cudaMallocHost(&h_query_lens, sizeof(uint16_t) * 8);
-        cudaMallocHost(&grouptopk_val, sizeof(uint16_t) * grouptopk_size * TOPK * 8);
-        cudaMallocHost(&grouptopk_idx, sizeof(int32_t) * grouptopk_size * TOPK * 8);
         cudaMallocHost(&h_dict, sizeof(uint8_t) * 50000);
-
+        cudaMallocHost(&h_grouptopk_val, sizeof(uint16_t) * grouptopk_size * TOPK * 8);
+        cudaMallocHost(&h_grouptopk_idx, sizeof(int32_t) * grouptopk_size * TOPK * 8);
+        
         cudaMalloc(&d_docs, sizeof(uint16_t) * MAX_DOC_SIZE * N);
-        cudaMalloc(&d_query, sizeof(uint16_t) * MAX_QUERY_SIZE);
-        cudaMalloc(&d_querys, sizeof(uint16_t) * MAX_QUERY_SIZE * 8);
         cudaMalloc(&d_query_lens, sizeof(uint16_t) * 8);
         cudaMalloc(&d_doc_lens, sizeof(uint16_t) * N);
         cudaMalloc(&d_scores, sizeof(uint16_t) * N * 8);
@@ -344,44 +338,37 @@ public:
             const int32_t sorted_indices_aligned_bytes = indices_aligned_bytes;
             int32_t temp_storage_bytes = InferTempStorageForSortPairsDescending<uint16_t, int32_t>(instance_size, instance_num);
             GLOBAL_WORKSPACE_SIZE = GetAlignedSize(sorted_in_aligned_bytes + indices_aligned_bytes + sorted_indices_aligned_bytes + temp_storage_bytes);
-            cudaMalloc(&grouptopk_workspace, GLOBAL_WORKSPACE_SIZE * sizeof(uint8_t));
+            cudaMalloc(&d_grouptopk_workspace, GLOBAL_WORKSPACE_SIZE * sizeof(uint8_t));
         }
-
-        std::chrono::high_resolution_clock::time_point t2 = std::chrono::high_resolution_clock::now();
-        std::cout<<"Init with N="<<N<<", cost:"<<std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count()<<"ms"<<std::endl;
-        std::cout<<"------------- CUDA Init -------------"<<std::endl;
     }
 
     ~CUDAInit() {
-        cudaFree(d_dict);
-        cudaFree(d_docs);
-        cudaFree(d_query);
-        cudaFree(d_querys);
-        cudaFree(d_query_lens);
-        cudaFree(d_scores);
-        cudaFree(d_doc_lens);
-        cudaFree(grouptopk_workspace);
-        cudaFreeHost(grouptopk_val);
-        cudaFreeHost(grouptopk_idx);
         cudaFreeHost(h_docs);
+        cudaFreeHost(h_query_lens);
         cudaFreeHost(h_dict);
+        cudaFreeHost(h_grouptopk_val);
+        cudaFreeHost(h_grouptopk_idx);
+        
+        cudaFree(d_docs);
+        cudaFree(d_query_lens);
+        cudaFree(d_doc_lens);
+        cudaFree(d_scores);
+        cudaFree(d_dict);
+        cudaFree(d_grouptopk_workspace);
     }
 
-    uint16_t *h_docs = nullptr;
-    uint16_t *h_querys = nullptr;
-    uint16_t *h_query_lens = nullptr;
-    uint16_t* grouptopk_val = nullptr;
-    int32_t* grouptopk_idx = nullptr;
-    uint8_t* h_dict = nullptr;
-
+    uint16_t* h_docs = nullptr;
+    uint16_t* h_query_lens = nullptr;
+    uint8_t*  h_dict = nullptr;
+    uint16_t* h_grouptopk_val = nullptr;
+    int32_t*  h_grouptopk_idx = nullptr;
+    
     uint16_t* d_docs = nullptr;
-    uint16_t* d_query = nullptr;
-    uint16_t* d_querys = nullptr;
     uint16_t* d_query_lens = nullptr;
     uint16_t* d_doc_lens = nullptr;
     uint16_t* d_scores = nullptr;
-    uint8_t* d_dict = nullptr;
-    uint8_t* grouptopk_workspace = nullptr;
+    uint8_t*  d_dict = nullptr;
+    uint8_t*  d_grouptopk_workspace = nullptr;
 };
 CUDAInit cudaInit(8500000); // 850万
 
@@ -389,7 +376,8 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     std::vector<std::vector<uint16_t>> &docs,
     std::vector<uint16_t> &lens,
     std::vector<std::vector<int>> &indices //shape [querys.size(), TOPK]
-    ) {
+    ) 
+{
 
     int n_docs = docs.size();
     n_docs = ((n_docs - 1) / grouptopk_size + 1) * grouptopk_size;
@@ -401,22 +389,7 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
 
     int64_t cT = 0;
     h1 = std::chrono::high_resolution_clock::now();
-    // #pragma omp parallel for
-    // for (int i = 0; i < docs.size(); i++) {
-    //     for (int j = 0; j < lens[i]; j++) {
-    //         auto group_sz = sizeof(group_t) / sizeof(uint16_t);
-    //         auto layer_0_offset = j / group_sz;
-    //         auto layer_0_stride = n_docs * group_sz;
-    //         auto layer_1_offset = i;
-    //         auto layer_1_stride = group_sz;
-    //         auto layer_2_offset = j % group_sz;
-    //         auto final_offset = layer_0_offset * layer_0_stride + layer_1_offset * layer_1_stride + layer_2_offset;
-    //         cudaInit.h_docs[final_offset] = std::move(docs[i][j]);
-    //     }
-    // }
-
-    int numThreads = omp_get_max_threads();
-    std::cout<<"max thread:"<<numThreads<<std::endl;
+    int numThreads = std::thread::hardware_concurrency();
     int docsSize = docs.size();
     int docsPerThread = docsSize / numThreads;
     std::vector<std::thread> threads;
@@ -425,7 +398,6 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
         auto end = start + docsPerThread;
         if (q == numThreads-1) end = docsSize;
         threads.emplace_back([&](int s, int e){
-            // std::chrono::high_resolution_clock::time_point d1 = std::chrono::high_resolution_clock::now();
             for (int i = s; i < e; i++) {
                 for (int j = 0; j < lens[i]; j++) {
                     auto group_sz = sizeof(group_t) / sizeof(uint16_t);
@@ -438,13 +410,9 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
                     cudaInit.h_docs[final_offset] = docs[i][j];
                 }
             }
-            // std::chrono::high_resolution_clock::time_point d2 = std::chrono::high_resolution_clock::now();
-            // int64_t tt = std::chrono::duration_cast<std::chrono::milliseconds>(d2 - d1).count();
-            // std::cout<<tt<<std::endl;
         },start,end);
     }
     for (auto& thread : threads) thread.join();
-
     h2 = std::chrono::high_resolution_clock::now();
     cT = std::chrono::duration_cast<std::chrono::milliseconds>(h2 - h1).count();
 
@@ -462,7 +430,6 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     h1 = std::chrono::high_resolution_clock::now();
     for (; cur_pos + 8 < querys.size(); cur_pos+=8) {
         memset(cudaInit.h_dict, 0, sizeof(uint8_t) * 50000);
-        memset(cudaInit.h_query_lens, 0, sizeof(uint16_t) * 8);
         for(int i = 0; i < 8; i++) {
             for(int j = 0; j < querys[cur_pos+i].size(); j++)
                 cudaInit.h_dict[querys[cur_pos+i][j]] |= 1<<i;
@@ -478,13 +445,13 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
 
         topk_launcher<uint16_t>(0,
             n_docs*8,           // elem_cnt
-            grouptopk_size,   // instance_size
+            grouptopk_size,     // instance_size
             grouptopk_batch*8,  // instance_num
-            TOPK,             // top_k
+            TOPK,               // top_k
             cudaInit.d_scores,
-            cudaInit.grouptopk_workspace,
-            cudaInit.grouptopk_idx,
-            cudaInit.grouptopk_val);
+            cudaInit.d_grouptopk_workspace,
+            cudaInit.h_grouptopk_idx,
+            cudaInit.h_grouptopk_val);
 
         for(int bb = 0; bb < 8; bb++) {
             std::vector<int> top(grouptopk_batch,0);
@@ -493,15 +460,15 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
                 int idx = -1;
                 int16_t val = -1;
                 for (int j = 0; j < grouptopk_batch; j++) {
-                    if (cudaInit.grouptopk_val[bb*TOPK*grouptopk_batch+j*TOPK+top[j]] > val) {
-                        val = cudaInit.grouptopk_val[bb*TOPK*grouptopk_batch+j*TOPK+top[j]];
-                        idx = cudaInit.grouptopk_idx[bb*TOPK*grouptopk_batch+j*TOPK+top[j]] + j*grouptopk_size;
+                    if (cudaInit.h_grouptopk_val[bb*TOPK*grouptopk_batch+j*TOPK+top[j]] > val) {
+                        val = cudaInit.h_grouptopk_val[bb*TOPK*grouptopk_batch+j*TOPK+top[j]];
+                        idx = cudaInit.h_grouptopk_idx[bb*TOPK*grouptopk_batch+j*TOPK+top[j]] + j*grouptopk_size;
                     }
                 }
                 topk[i] = idx;
                 top[idx/grouptopk_size]++;
             }
-            indices.push_back(topk);
+            indices.emplace_back(topk);
         }
     }
     h2 = std::chrono::high_resolution_clock::now();
@@ -529,9 +496,9 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
             grouptopk_batch,  // instance_num
             TOPK,             // top_k
             cudaInit.d_scores,
-            cudaInit.grouptopk_workspace,
-            cudaInit.grouptopk_idx,
-            cudaInit.grouptopk_val);
+            cudaInit.d_grouptopk_workspace,
+            cudaInit.h_grouptopk_idx,
+            cudaInit.h_grouptopk_val);
 
         std::vector<int> top(grouptopk_batch,0);
         std::vector<int> topk(TOPK);
@@ -539,15 +506,15 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
             int idx = -1;
             int16_t val = -1;
             for (int j = 0; j < grouptopk_batch; j++) {
-                if (cudaInit.grouptopk_val[j*TOPK+top[j]] > val) {
-                    val = cudaInit.grouptopk_val[j*TOPK+top[j]];
-                    idx = cudaInit.grouptopk_idx[j*TOPK+top[j]] + j*grouptopk_size;
+                if (cudaInit.h_grouptopk_val[j*TOPK+top[j]] > val) {
+                    val = cudaInit.h_grouptopk_val[j*TOPK+top[j]];
+                    idx = cudaInit.h_grouptopk_idx[j*TOPK+top[j]] + j*grouptopk_size;
                 }
             }
             topk[i] = idx;
             top[idx/grouptopk_size]++;
         }
-        indices.push_back(topk);
+        indices.emplace_back(topk);
     }
     h2 = std::chrono::high_resolution_clock::now();
     b1T = (double)std::chrono::duration_cast<std::chrono::milliseconds>(h2 - h1).count() / (querys.size()%8);
