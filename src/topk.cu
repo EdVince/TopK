@@ -365,7 +365,7 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
 
     int64_t cT = 0;
     h1 = std::chrono::high_resolution_clock::now();
-    int numThreads = std::thread::hardware_concurrency();
+    int numThreads = std::thread::hardware_concurrency() / 4;
     int docsSize = docs.size();
     int docsPerThread = docsSize / numThreads;
     std::vector<std::thread> threads;
