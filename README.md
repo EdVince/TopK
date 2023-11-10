@@ -17,10 +17,7 @@
 8. 9.22509分：全局CUDA预分配，cub的topk算法
 9. 10.77255分：实现了batch8
 10. 17.56147分(平均13.64522分)：convert从openmp换成了手动多线程
-```
-[TIME] convert:98ms, transfer:270ms
-[TIME] Batch8:1.75ms, Batch1:5.00ms
-```
+11. 12.69956分(降低有待研究)：kernel实现了batch32、batch16、batch8、batchN的全覆盖，topk是batch16、batch8、batchN
 
 ## CPU优化(不算分)
 1. 多线程分块读取大txt文件
