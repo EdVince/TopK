@@ -438,46 +438,25 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
 
     int64_t rtT = 0;
     h1 = std::chrono::high_resolution_clock::now();
-    cudaStream_t memcpyStream;
-    cudaStreamCreate(&memcpyStream);
-    int numPart = 4;
     int numThreads = std::thread::hardware_concurrency() / 4;
     int docsSize = docs.size();
-    int docsPerThread = docsSize / numThreads / numPart;
-    cudaMemcpy(cudaInit.d_doc_lens, lens.data(), sizeof(uint16_t) * n_docs, cudaMemcpyHostToDevice);
-    bool memcpyShot = false;
-    for (auto p = 0; p < numPart; p++) {
-        std::vector<std::thread> threads;
-        for (auto t = 0; t < numThreads; t++) {
-            auto start = (p*numThreads+t) * docsPerThread;
-            auto end = start + docsPerThread;
-            if (p == numPart-1 && t == numThreads-1) end = docsSize;
-            threads.emplace_back([&](int s, int e){
-                for (int i = s; i < e; i++) {
-                    for (int j = 0; j < lens[i]; j++) {
-                        cudaInit.h_docs_T[i*MAX_DOC_SIZE+j] = docs[i][j];
-                    }
+    int docsPerThread = docsSize / numThreads;
+    std::vector<std::thread> threads;
+    for (int q = 0; q < numThreads; q++) {
+        auto start = q * docsPerThread;
+        auto end = start + docsPerThread;
+        if (q == numThreads-1) end = docsSize;
+        threads.emplace_back([&](int s, int e){
+            for (int i = s; i < e; i++) {
+                for (int j = 0; j < lens[i]; j++) {
+                    cudaInit.h_docs_T[i*MAX_DOC_SIZE+j] = docs[i][j];
                 }
-            },start,end);
-        }
-
-        if (memcpyShot) {
-            auto start = (p-1) * docsPerThread * numThreads;
-            auto end = start + docsPerThread * numThreads;
-            auto len = end - start;
-            cudaMemcpyAsync(cudaInit.d_docs_T + start * MAX_DOC_SIZE, cudaInit.h_docs_T + start * MAX_DOC_SIZE, sizeof(uint16_t) * MAX_DOC_SIZE * len, cudaMemcpyHostToDevice, memcpyStream);
-        }
-
-        for (auto& thread : threads) thread.join();
-        if (memcpyShot) cudaStreamSynchronize(memcpyStream);
-
-        if (!memcpyShot) memcpyShot = true;
+            }
+        },start,end);
     }
-    {
-        auto start = (numPart-1) * docsPerThread * numThreads;
-        auto len = docsSize - start;
-        cudaMemcpy(cudaInit.d_docs_T + start * MAX_DOC_SIZE, cudaInit.h_docs_T + start * MAX_DOC_SIZE, sizeof(uint16_t) * MAX_DOC_SIZE * len, cudaMemcpyHostToDevice);
-    }
+    for (auto& thread : threads) thread.join();
+    cudaMemcpy(cudaInit.d_doc_lens, lens.data(), sizeof(uint16_t) * n_docs, cudaMemcpyHostToDevice);
+    cudaMemcpy(cudaInit.d_docs_T, cudaInit.h_docs_T, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs, cudaMemcpyHostToDevice);
     h2 = std::chrono::high_resolution_clock::now();
     rtT = std::chrono::duration_cast<std::chrono::milliseconds>(h2 - h1).count();
 
