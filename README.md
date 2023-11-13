@@ -18,9 +18,9 @@
 9. 10.77255分：实现了batch8
 10. 17.56147分(13.64522分)：convert从openmp换成了手动多线程
 11. 12.69956分：kernel实现了batch32、batch16、batch8、batchN的全覆盖，topk是batch16、batch8、batchN
-12. 20.28398分(19.93734分)：convert线程设置为系统最大线程数量的1/4，测评机内存性能较低
-13. 15.49358分(19.29438分)：convert改成read，并跟transfer做4分块的overlap
-14. 20.28398分：read+transpose，但是不overlap了
+12. 20.28398分(19.93734分、17.95793分)：convert线程设置为系统最大线程数量的1/4，测评机内存性能较低
+13. 15.49358分(19.29438分、20.66726分)：convert改成read，并跟transfer做4分块的overlap
+14. 20.28398分(17.17791分)：read+transpose，但是不overlap了
 
 ## CPU优化(不算分)
 1. 多线程分块读取大txt文件
