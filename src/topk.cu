@@ -94,8 +94,8 @@ void SortPairsDescending(
         /* num_segments */ num_row,
         /* d_begin_offsets */ segment_offset_iter,
         /* d_end_offsets */ segment_offset_iter + 1,
-        /* begin_bit */ 0,
-        /* end_bit */ sizeof(KeyType) * 8,
+        /* begin_bit */ 2,
+        /* end_bit */ /* sizeof(KeyType) * 8 */ 14,
         /* stream */ stream);
 }
 
@@ -492,6 +492,8 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     kernelT /= (cur_pos-start_pos);
     topkT /= (cur_pos-start_pos);
     printf("[TIME] [B8] num:%d, kernel:%ldus, topk:%ldus\n",cur_pos-start_pos,kernelT,topkT);
+
+
 
 
 
