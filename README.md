@@ -22,5 +22,7 @@
 13. 15.49358分(19.29438分、20.66726分)：convert改成read，并跟transfer做4分块的overlap
 14. 20.28398分(17.17791分)：read+transpose，但是不overlap了
 
+1. 6.72043分：topk的下标从int32_t降级到了uint16_t
+
 ## CPU优化(不算分)
 1. 多线程分块读取大txt文件

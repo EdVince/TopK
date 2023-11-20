@@ -110,12 +110,12 @@ public:
     const int32_t sorted_in_aligned_bytes =
         GetAlignedSize(sorted_in_elem_cnt_ * sizeof(T));
     const int32_t indices_aligned_bytes =
-        GetAlignedSize(indices_elem_cnt_ * sizeof(int32_t));
+        GetAlignedSize(indices_elem_cnt_ * sizeof(uint16_t));
     const int32_t sorted_indices_aligned_bytes = indices_aligned_bytes;
     sorted_in_ptr_ = reinterpret_cast<T*>(ptr);
-    indices_ptr_ = reinterpret_cast<int32_t*>(
+    indices_ptr_ = reinterpret_cast<uint16_t*>(
         reinterpret_cast<char*>(sorted_in_ptr_) + sorted_in_aligned_bytes);
-    sorted_indices_ptr_ = reinterpret_cast<int32_t*>(
+    sorted_indices_ptr_ = reinterpret_cast<uint16_t*>(
         reinterpret_cast<char*>(indices_ptr_) + indices_aligned_bytes);
     temp_storage_ptr_ = reinterpret_cast<void*>(
         reinterpret_cast<char*>(sorted_indices_ptr_) +
@@ -128,10 +128,10 @@ public:
     T* SortedInPtr() const {
         return sorted_in_ptr_;
     }
-    int32_t* IndicesPtr() const {
+    uint16_t* IndicesPtr() const {
         return indices_ptr_;
     }
-    int32_t* SortedIndicesPtr() const {
+    uint16_t* SortedIndicesPtr() const {
         return sorted_indices_ptr_;
     }
     void* TempStoragePtr() const {
@@ -145,8 +145,8 @@ private:
     int32_t capacity_;
 
     T* sorted_in_ptr_;
-    int32_t* indices_ptr_;
-    int32_t* sorted_indices_ptr_;
+    uint16_t* indices_ptr_;
+    uint16_t* sorted_indices_ptr_;
     void* temp_storage_ptr_;
 
     int32_t sorted_in_elem_cnt_;
@@ -157,7 +157,7 @@ private:
 
 __global__ void InitializeIndices(
         int32_t elem_cnt,
-        int32_t* indices_ptr,
+        uint16_t* indices_ptr,
         int32_t instance_size) {
     GPU_KERNEL_LOOP(i, elem_cnt) {
         indices_ptr[i] = i % instance_size;
@@ -218,11 +218,11 @@ void topk_launcher(
     cudaDeviceSynchronize();
 
     cudaMemcpy2D(
-        (int32_t*)output_index,
-        k * sizeof(int32_t),
+        (uint16_t*)output_index,
+        k * sizeof(uint16_t),
         buf_manager.SortedIndicesPtr(),
-        instance_size * sizeof(int32_t),
-        k * sizeof(int32_t),
+        instance_size * sizeof(uint16_t),
+        k * sizeof(uint16_t),
         instance_num,
         cudaMemcpyDefault);
 
@@ -281,7 +281,8 @@ void __global__ docQueryScoringCoalescedMemoryAccessSampleKernelBatchN(
         }
         #pragma unroll
         for (auto l = 0; l < len; l++) {
-            scores[l*n_docs+doc_id] = 16384 * tmp_score[l] / max(query_lens[l], doc_lens[doc_id]);
+            register uint16_t score = 16384 * tmp_score[l] / max(query_lens[l], doc_lens[doc_id]);
+            scores[l*n_docs+doc_id] = score;
         }
     }
 }
@@ -307,7 +308,7 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     uint16_t* h_query_lens = nullptr;
     uint8_t * h_dict8 = nullptr;
     uint16_t* h_grouptopk_val = nullptr;
-    int32_t * h_grouptopk_idx = nullptr;
+    uint16_t * h_grouptopk_idx = nullptr;
     
     uint16_t* d_docs = nullptr;
     uint16_t* d_docs_T = nullptr;
@@ -333,7 +334,7 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     h_query_lens = (uint16_t*)calloc(8, sizeof(uint16_t)); // 2*8=16B
     h_dict8 = (uint8_t*)calloc(50000, sizeof(uint8_t)); // 1*5000=5KB
     h_grouptopk_val = (uint16_t*)calloc(grouptopk_batch * TOPK * 8, sizeof(uint16_t)); // 2*(8000000/65536)*100*8=200MB
-    h_grouptopk_idx = (int32_t*)calloc(grouptopk_batch * TOPK * 8, sizeof(int32_t)); // 4*(8000000/65536)*100*8=400MB
+    h_grouptopk_idx = (uint16_t*)calloc(grouptopk_batch * TOPK * 8, sizeof(uint16_t)); // 4*(8000000/65536)*100*8=400MB
     indices.resize(querys.size(), std::vector<int>(TOPK));
     h2 = std::chrono::high_resolution_clock::now();
     int newHT = std::chrono::duration_cast<std::chrono::milliseconds>(h2 - h1).count();
@@ -352,9 +353,9 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
         int64_t instance_size = grouptopk_size;
         int64_t instance_num = elem_cnt / instance_size;
         int64_t sorted_in_aligned_bytes = GetAlignedSize(elem_cnt * sizeof(uint16_t));
-        int64_t indices_aligned_bytes = GetAlignedSize(elem_cnt * sizeof(int32_t));
+        int64_t indices_aligned_bytes = GetAlignedSize(elem_cnt * sizeof(uint16_t));
         int64_t sorted_indices_aligned_bytes = indices_aligned_bytes;
-        int64_t temp_storage_bytes = InferTempStorageForSortPairsDescending<uint16_t, int32_t>(instance_size, instance_num);
+        int64_t temp_storage_bytes = InferTempStorageForSortPairsDescending<uint16_t, uint16_t>(instance_size, instance_num);
         GLOBAL_WORKSPACE_SIZE = GetAlignedSize(sorted_in_aligned_bytes + indices_aligned_bytes + sorted_indices_aligned_bytes + temp_storage_bytes);
         cudaMalloc(&d_grouptopk_workspace, GLOBAL_WORKSPACE_SIZE * sizeof(uint8_t)); // 1*1031799296=1GB
     }
