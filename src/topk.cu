@@ -94,7 +94,7 @@ void SortPairsDescending(
         /* num_segments */ num_row,
         /* d_begin_offsets */ segment_offset_iter,
         /* d_end_offsets */ segment_offset_iter + 1,
-        /* begin_bit */ 2,
+        /* begin_bit */ 4,
         /* end_bit */ /* sizeof(KeyType) * 8 */ 14,
         /* stream */ stream);
 }
