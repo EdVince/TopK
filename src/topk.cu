@@ -333,43 +333,29 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     h2 = std::chrono::high_resolution_clock::now();
     int newHT = std::chrono::duration_cast<std::chrono::milliseconds>(h2 - h1).count();
 
-    // cuda初始化
-    h1 = std::chrono::high_resolution_clock::now();
-    cudaSetDevice(0);
-    cudaFree(0);
-    cudaStreamCreate(&streamA);
-    cudaStreamCreate(&streamB);
-    h2 = std::chrono::high_resolution_clock::now();
-    int initT = std::chrono::duration_cast<std::chrono::milliseconds>(h2 - h1).count();
 
-    // 分配显存
-    h1 = std::chrono::high_resolution_clock::now();
-    cudaMalloc(&d_docs_T, sizeof(uint16_t) * MAX_DOC_SIZE * N); // 2*128*8000000=2GB
-    cudaMalloc(&d_docs, sizeof(uint16_t) * MAX_DOC_SIZE * N); // 2*128*8000000=2GB
-    cudaMalloc(&d_query_lens, sizeof(uint16_t) * 8); // 2*8=16B
-    cudaMalloc(&d_doc_lens, sizeof(uint16_t) * N); // 2*8000000=16MB
-    cudaMalloc(&d_scores, sizeof(uint16_t) * N * 8); // 2*8000000*8=128MB
-    cudaMalloc(&d_dict8, sizeof(uint8_t) * 50000); // 1*5000=5KB
-    {
-        int64_t GLOBAL_WORKSPACE_SIZE = 0;
-        int64_t elem_cnt = N * 8;
-        int64_t instance_size = grouptopk_size;
-        int64_t instance_num = elem_cnt / instance_size;
-        int64_t sorted_in_aligned_bytes = GetAlignedSize(elem_cnt * sizeof(uint16_t));
-        int64_t indices_aligned_bytes = GetAlignedSize(elem_cnt * sizeof(uint16_t));
-        int64_t sorted_indices_aligned_bytes = indices_aligned_bytes;
-        int64_t temp_storage_bytes = InferTempStorageForSortPairsDescending<uint16_t, uint16_t>(instance_size, instance_num);
-        GLOBAL_WORKSPACE_SIZE = GetAlignedSize(sorted_in_aligned_bytes + indices_aligned_bytes + sorted_indices_aligned_bytes + temp_storage_bytes);
-        cudaMalloc(&d_grouptopk_workspace, GLOBAL_WORKSPACE_SIZE * sizeof(uint8_t)); // 1*1031799296=1GB
-    }
-    h2 = std::chrono::high_resolution_clock::now();
-    int newDT = std::chrono::duration_cast<std::chrono::milliseconds>(h2 - h1).count();
+
+    // cuda初始化
+    int initT = 0;
+    std::thread cudaInitThread([&](){
+        std::chrono::high_resolution_clock::time_point h1 = std::chrono::high_resolution_clock::now();
+        cudaSetDevice(0);
+        cudaFree(0);
+        cudaStreamCreate(&streamA);
+        cudaStreamCreate(&streamB);
+        cudaMalloc(&d_docs_T, sizeof(uint16_t) * MAX_DOC_SIZE * N); // 2*128*8000000=2GB
+        std::chrono::high_resolution_clock::time_point h2 = std::chrono::high_resolution_clock::now();
+        initT = std::chrono::duration_cast<std::chrono::milliseconds>(h2 - h1).count();
+    });
+    cudaInitThread.join();
+
+
 
     // 转换并传输
     int64_t rtT = 0;
     h1 = std::chrono::high_resolution_clock::now();
-    int numPart = 4;
-    int numThreads = std::thread::hardware_concurrency() / 4;
+    int numPart = 4; // 分块数量
+    int numThreads = 5; // 10核20线程，用一半的核
     int docsSize = docs.size();
     int docsPerThread = docsSize / numThreads / numPart;
     bool memcpyShot = false;
@@ -389,23 +375,50 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
         }
         if (memcpyShot) {
             auto start = (p-1) * docsPerThread * numThreads;
-            auto end = start + docsPerThread * numThreads;
-            auto len = end - start;
+            auto len = docsPerThread * numThreads;
             cudaMemcpyAsync(d_docs_T + start * MAX_DOC_SIZE, h_docs_T + start * MAX_DOC_SIZE, sizeof(uint16_t) * MAX_DOC_SIZE * len, cudaMemcpyHostToDevice, streamA);
         }
+
         for (auto& thread : threads) thread.join();
         if (memcpyShot) cudaStreamSynchronize(streamA);
-        if (!memcpyShot) memcpyShot = true;
+
+        if (!memcpyShot) {
+            memcpyShot = true;
+        }
     }
     {
         auto start = (numPart-1) * docsPerThread * numThreads;
         auto len = docsSize - start;
         cudaMemcpy(d_docs_T + start * MAX_DOC_SIZE, h_docs_T + start * MAX_DOC_SIZE, sizeof(uint16_t) * MAX_DOC_SIZE * len, cudaMemcpyHostToDevice);
     }
-    cudaMemcpy(d_doc_lens, lens.data(), sizeof(uint16_t) * n_docs, cudaMemcpyHostToDevice);
     h2 = std::chrono::high_resolution_clock::now();
     rtT = std::chrono::duration_cast<std::chrono::milliseconds>(h2 - h1).count();
 
+
+
+
+    // 分配显存
+    h1 = std::chrono::high_resolution_clock::now();
+    cudaMalloc(&d_docs, sizeof(uint16_t) * MAX_DOC_SIZE * N); // 2*128*8000000=2GB
+    cudaMalloc(&d_query_lens, sizeof(uint16_t) * 8); // 2*8=16B
+    cudaMalloc(&d_doc_lens, sizeof(uint16_t) * N); // 2*8000000=16MB
+    cudaMalloc(&d_scores, sizeof(uint16_t) * N * 8); // 2*8000000*8=128MB
+    cudaMalloc(&d_dict8, sizeof(uint8_t) * 50000); // 1*5000=5KB
+    {
+        int64_t GLOBAL_WORKSPACE_SIZE = 0;
+        int64_t elem_cnt = N * 8;
+        int64_t instance_size = grouptopk_size;
+        int64_t instance_num = elem_cnt / instance_size;
+        int64_t sorted_in_aligned_bytes = GetAlignedSize(elem_cnt * sizeof(uint16_t));
+        int64_t indices_aligned_bytes = GetAlignedSize(elem_cnt * sizeof(uint16_t));
+        int64_t sorted_indices_aligned_bytes = indices_aligned_bytes;
+        int64_t temp_storage_bytes = InferTempStorageForSortPairsDescending<uint16_t, uint16_t>(instance_size, instance_num);
+        GLOBAL_WORKSPACE_SIZE = GetAlignedSize(sorted_in_aligned_bytes + indices_aligned_bytes + sorted_indices_aligned_bytes + temp_storage_bytes);
+        cudaMalloc(&d_grouptopk_workspace, GLOBAL_WORKSPACE_SIZE * sizeof(uint8_t)); // 1*1031799296=1GB
+    }
+    cudaMemcpy(d_doc_lens, lens.data(), sizeof(uint16_t) * n_docs, cudaMemcpyHostToDevice);
+    h2 = std::chrono::high_resolution_clock::now();
+    int newDT = std::chrono::duration_cast<std::chrono::milliseconds>(h2 - h1).count();
 
     // 转置
     int64_t cT = 0;
