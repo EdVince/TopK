@@ -347,7 +347,6 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
         std::chrono::high_resolution_clock::time_point h2 = std::chrono::high_resolution_clock::now();
         initT = std::chrono::duration_cast<std::chrono::milliseconds>(h2 - h1).count();
     });
-    cudaInitThread.join();
 
 
 
@@ -384,6 +383,7 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
 
         if (!memcpyShot) {
             memcpyShot = true;
+            cudaInitThread.join();
         }
     }
     {
