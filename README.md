@@ -22,11 +22,13 @@
 13. 15.49358分(19.29438分、20.66726分)：convert改成read，并跟transfer做4分块的overlap
 14. 20.28398分(17.17791分)：read+transpose，但是不overlap了
 
+
 1. 6.72043分：topk的下标从int32_t降级到了uint16_t
 2. 6.94513分：数据分析发现，score存在精度gap，只计算2~14bit的排序
 3. 6.92795分：只计算4~14bit的排序
 4. 10.23392分：2~14bit排序，不free，调整整理一下代码，用作下一步优化的baseline
 5. 10.23242分：overlap和cudainif但效果不好，猜测cudainit是高占用，资源不足以overlap
+6. 10.72797分：用cuda driver的api拆成init和ctx，把ctx放进read的第一个block里
 
 ## CPU优化(不算分)
 1. 多线程分块读取大txt文件
