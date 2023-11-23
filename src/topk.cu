@@ -250,6 +250,18 @@ __global__ void permute102_kernel(uint16_t* output,
     }
 }
 
+__global__ void permute_kernel(uint16_t* output, const __restrict__ uint16_t *input, const int n_docs) {
+    register auto n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= n_docs)
+        return;
+    for (auto i = 0; i < 16; i++) {
+        for (auto j = 0; j < 8; j++) {
+            // output[i*2000000*8+n*8+j] = input[2000000*((n%4)*128+i*8+j)+(n/4)];
+            output[i*n_docs*8+n*8+j] = input[n/2000000*128*2000000+i*8*2000000+j*2000000+n%2000000];
+        }
+    }
+}
+
 template <typename T, const int len>
 void __global__ docQueryScoringCoalescedMemoryAccessSampleKernelBatchN(
         const __restrict__ uint16_t *docs, const uint16_t *doc_lens, const size_t n_docs, 
@@ -301,14 +313,14 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     int grid = (n_docs + block - 1) / block;
 
 
-    uint16_t* h_docs_T = nullptr;
+    uint16_t* h_docs_128_n = nullptr;
     uint16_t* h_query_lens = nullptr;
     uint8_t * h_dict8 = nullptr;
     uint16_t* h_grouptopk_val = nullptr;
     uint16_t* h_grouptopk_idx = nullptr;
     
     uint16_t* d_docs = nullptr;
-    uint16_t* d_docs_T = nullptr;
+    uint16_t* d_docs_128_n = nullptr;
     uint16_t* d_query_lens = nullptr;
     uint16_t* d_doc_lens = nullptr;
     uint16_t* d_scores = nullptr;
@@ -323,7 +335,7 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
 
     // 分配内存
     h1 = std::chrono::high_resolution_clock::now();
-    h_docs_T = (uint16_t*)calloc(MAX_DOC_SIZE * N, sizeof(uint16_t)); // 2*128*8000000=2GB
+    h_docs_128_n = (uint16_t*)calloc(MAX_DOC_SIZE * N, sizeof(uint16_t)); // 2*128*8000000=2GB
     h_query_lens = (uint16_t*)calloc(8, sizeof(uint16_t)); // 2*8=16B
     h_dict8 = (uint8_t*)calloc(50000, sizeof(uint8_t)); // 1*5000=5KB
     h_grouptopk_val = (uint16_t*)calloc(grouptopk_batch * TOPK * 8, sizeof(uint16_t)); // 2*(8000000/65536)*100*8=200MB
@@ -343,14 +355,14 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
 
     // context初始化
     int ctxT = 0;
-    // std::chrono::high_resolution_clock::time_point hh1 = std::chrono::high_resolution_clock::now();
-    // CUcontext context;
-    // cuCtxCreate(&context, CU_CTX_SCHED_YIELD, 0);
-    // cudaStreamCreate(&streamA);
-    // cudaStreamCreate(&streamB);
-    // cudaMalloc(&d_docs_T, sizeof(uint16_t) * MAX_DOC_SIZE * N); // 2*128*8000000=2GB
-    // std::chrono::high_resolution_clock::time_point hh2 = std::chrono::high_resolution_clock::now();
-    // ctxT = std::chrono::duration_cast<std::chrono::milliseconds>(hh2 - hh1).count();
+    std::chrono::high_resolution_clock::time_point hh1 = std::chrono::high_resolution_clock::now();
+    CUcontext context;
+    cuCtxCreate(&context, CU_CTX_SCHED_YIELD, 0);
+    cudaStreamCreate(&streamA);
+    cudaStreamCreate(&streamB);
+    cudaMalloc(&d_docs_128_n, sizeof(uint16_t) * MAX_DOC_SIZE * N);
+    std::chrono::high_resolution_clock::time_point hh2 = std::chrono::high_resolution_clock::now();
+    ctxT = std::chrono::duration_cast<std::chrono::milliseconds>(hh2 - hh1).count();
 
 
 
@@ -360,51 +372,32 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     int numPart = 4; // 分块数量
     int numThreads = 5; // 10核20线程，用一半的核
     int docsSize = docs.size();
-    int docsPerThread = docsSize / numThreads / numPart;
-    bool memcpyShot = false;
+    int docsPerThread = N / numPart;
     for (auto p = 0; p < numPart; p++) {
-        std::vector<std::thread> threads;
-        for (auto t = 0; t < numThreads; t++) {
-            auto start = (p*numThreads+t) * docsPerThread;
-            auto end = start + docsPerThread;
-            if (p == numPart-1 && t == numThreads-1) end = docsSize;
-            threads.emplace_back([&](int s, int e){
-                for (int i = s; i < e; i++) {
-                    for (int j = 0; j < lens[i]; j++) {
-                        h_docs_T[i*MAX_DOC_SIZE+j] = docs[i][j];
-                    }
-                }
-            },start,end);
-        }
-        if (memcpyShot) {
-            auto start = (p-1) * docsPerThread * numThreads;
-            auto len = docsPerThread * numThreads;
-            cudaMemcpyAsync(d_docs_T + start * MAX_DOC_SIZE, h_docs_T + start * MAX_DOC_SIZE, sizeof(uint16_t) * MAX_DOC_SIZE * len, cudaMemcpyHostToDevice, streamA);
-        }
-
-        if (!memcpyShot) {
-            // context初始化
-            std::chrono::high_resolution_clock::time_point hh1 = std::chrono::high_resolution_clock::now();
-            CUcontext context;
-            cuCtxCreate(&context, CU_CTX_SCHED_YIELD, 0);
-            cudaStreamCreate(&streamA);
-            cudaStreamCreate(&streamB);
-            cudaMalloc(&d_docs_T, sizeof(uint16_t) * MAX_DOC_SIZE * N); // 2*128*8000000=2GB
-            std::chrono::high_resolution_clock::time_point hh2 = std::chrono::high_resolution_clock::now();
-            ctxT = std::chrono::duration_cast<std::chrono::milliseconds>(hh2 - hh1).count();
+        // std::vector<std::thread> threads;
+        // for (auto t = 0; t < numThreads; t++) {
+        //     auto start = (p*numThreads+t) * docsPerThread;
+        //     auto end = start + docsPerThread;
+        //     if (p == numPart-1 && t == numThreads-1) end = docsSize;
+        //     threads.emplace_back([&](int s, int e){
+        //         for (auto i = s; i < e; i++) {
+        //             for (auto j = 0; j < lens[i]; j++) {
+        //                 h_docs_128_n[p*128*2000000+j*2000000+i%2000000] = docs[i][j];
+        //             }
+        //         }
+        //     },start,end);
+        // }
+        // for (auto& thread : threads) thread.join();
+        auto start = p * docsPerThread;
+        auto end = start + docsPerThread;
+        if (p == numPart-1) end = docsSize;
+        for (auto i = start; i < end; i++) {
+            for (auto j = 0; j < lens[i]; j++) {
+                h_docs_128_n[p*128*2000000+j*2000000+i%2000000] = docs[i][j];
+            }
         }
 
-        for (auto& thread : threads) thread.join();
-        if (memcpyShot) cudaStreamSynchronize(streamA);
-
-        if (!memcpyShot) {
-            memcpyShot = true;
-        }
-    }
-    {
-        auto start = (numPart-1) * docsPerThread * numThreads;
-        auto len = docsSize - start;
-        cudaMemcpy(d_docs_T + start * MAX_DOC_SIZE, h_docs_T + start * MAX_DOC_SIZE, sizeof(uint16_t) * MAX_DOC_SIZE * len, cudaMemcpyHostToDevice);
+        cudaMemcpy(d_docs_128_n+p*128*(N/4), h_docs_128_n+p*128*(N/4), sizeof(uint16_t) * N/4 * (lens[end-1]+1), cudaMemcpyHostToDevice);
     }
     h2 = std::chrono::high_resolution_clock::now();
     rtT = std::chrono::duration_cast<std::chrono::milliseconds>(h2 - h1).count();
@@ -439,7 +432,7 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     // 转置
     int64_t cT = 0;
     h1 = std::chrono::high_resolution_clock::now();
-    permute102_kernel<<<grid, block, 0, streamA>>>(d_docs,d_docs_T,n_docs);
+    permute_kernel<<<grid, block, 0, streamA>>>(d_docs,d_docs_128_n,n_docs);
     cudaMemcpyAsync(d_doc_lens, lens.data(), sizeof(uint16_t) * n_docs, cudaMemcpyHostToDevice, streamB);
     cudaStreamSynchronize(streamA);
     cudaStreamSynchronize(streamB);

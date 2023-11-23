@@ -6,7 +6,15 @@
 3. 使用cudaMallocHost在cpu上发分配锁页内存：malloc变慢，host2device变快，但malloc更慢，得不偿失
 4. 提交打包：```zip -r result.zip src build.sh run.sh```
 
-## 提交记录(不稳定)
+## 提交记录(决赛)
+1. 6.72043分：topk的下标从int32_t降级到了uint16_t
+2. 6.94513分：数据分析发现，score存在精度gap，只计算2~14bit的排序
+3. 6.92795分：只计算4~14bit的排序
+4. 10.23392分：2~14bit排序，不free，调整整理一下代码，用作下一步优化的baseline
+5. 10.23242分：overlap和cudainif但效果不好，猜测cudainit是高占用，资源不足以overlap
+6. 10.72797分：用cuda driver的api拆成init和ctx，把ctx放进read的第一个block里
+
+## 提交记录(初赛)
 1. 0.00022分：convert format和malloc overlap
 2. 0.00023分：kernel+memcpy和sort overlap
 3. 0.00027分：calloc替换new+memeset，openmp并行化convert的for，碎片malloc合并到convert线程
@@ -21,14 +29,6 @@
 12. 20.28398分(19.93734分、17.95793分)：convert线程设置为系统最大线程数量的1/4，测评机内存性能较低
 13. 15.49358分(19.29438分、20.66726分)：convert改成read，并跟transfer做4分块的overlap
 14. 20.28398分(17.17791分)：read+transpose，但是不overlap了
-
-
-1. 6.72043分：topk的下标从int32_t降级到了uint16_t
-2. 6.94513分：数据分析发现，score存在精度gap，只计算2~14bit的排序
-3. 6.92795分：只计算4~14bit的排序
-4. 10.23392分：2~14bit排序，不free，调整整理一下代码，用作下一步优化的baseline
-5. 10.23242分：overlap和cudainif但效果不好，猜测cudainit是高占用，资源不足以overlap
-6. 10.72797分：用cuda driver的api拆成init和ctx，把ctx放进read的第一个block里
 
 ## CPU优化(不算分)
 1. 多线程分块读取大txt文件
