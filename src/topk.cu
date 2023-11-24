@@ -305,7 +305,6 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     uint16_t* h_query_lens = nullptr;
     uint8_t * h_dict8 = nullptr;
     uint16_t* h_dict16 = nullptr;
-    uint32_t* h_dict32 = nullptr;
     uint16_t* h_grouptopk_val = nullptr;
     uint16_t* h_grouptopk_idx = nullptr;
     
@@ -316,7 +315,6 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     uint16_t* d_scores = nullptr;
     uint8_t * d_dict8 = nullptr;
     uint16_t* d_dict16 = nullptr;
-    uint32_t* d_dict32 = nullptr;
     uint8_t * d_grouptopk_workspace = nullptr;
 
     cudaStream_t streamA, streamB;
@@ -328,10 +326,9 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     // 分配内存
     h1 = std::chrono::high_resolution_clock::now();
     h_docs_T = (uint16_t*)calloc(MAX_DOC_SIZE * N, sizeof(uint16_t)); // 2*128*8000000=2GB
-    h_query_lens = (uint16_t*)calloc(32, sizeof(uint16_t)); // 2*8=16B
-    h_dict8 = (uint8_t*)calloc(50000, sizeof(uint8_t)); // 1*5000=5KB
+    h_query_lens = (uint16_t*)calloc(16, sizeof(uint16_t)); // 2*8=16B
     h_dict16 = (uint16_t*)calloc(50000, sizeof(uint16_t)); // 1*5000=5KB
-    h_dict32 = (uint32_t*)calloc(50000, sizeof(uint32_t)); // 1*5000=5KB
+    h_dict8 = (uint8_t*)h_dict16; // 内存复用
     h_grouptopk_val = (uint16_t*)calloc(grouptopk_batch * TOPK * 16, sizeof(uint16_t)); // 2*(8000000/65536)*100*8=200MB
     h_grouptopk_idx = (uint16_t*)calloc(grouptopk_batch * TOPK * 16, sizeof(uint16_t)); // 4*(8000000/65536)*100*8=400MB
     indices.resize(querys.size(), std::vector<int>(TOPK));
@@ -421,24 +418,12 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     // 分配显存
     h1 = std::chrono::high_resolution_clock::now();
     cudaMalloc(&d_docs, sizeof(uint16_t) * MAX_DOC_SIZE * N); // 2*128*8000000=2GB
-    cudaMalloc(&d_query_lens, sizeof(uint16_t) * 32); // 2*8=16B
+    cudaMalloc(&d_query_lens, sizeof(uint16_t) * 16); // 2*8=16B
     cudaMalloc(&d_doc_lens, sizeof(uint16_t) * N); // 2*8000000=16MB
-    cudaMalloc(&d_scores, sizeof(uint16_t) * N * 32); // 2*8000000*8=128MB
-    cudaMalloc(&d_dict8, sizeof(uint8_t) * 50000); // 1*5000=5KB
+    cudaMalloc(&d_scores, sizeof(uint16_t) * N * 16); // 2*8000000*8=128MB
     cudaMalloc(&d_dict16, sizeof(uint16_t) * 50000); // 1*5000=5KB
-    cudaMalloc(&d_dict32, sizeof(uint32_t) * 50000); // 1*5000=5KB
-    {
-        int64_t GLOBAL_WORKSPACE_SIZE = 0;
-        int64_t elem_cnt = N * 16;
-        int64_t instance_size = grouptopk_size;
-        int64_t instance_num = elem_cnt / instance_size;
-        int64_t sorted_in_aligned_bytes = GetAlignedSize(elem_cnt * sizeof(uint16_t));
-        int64_t indices_aligned_bytes = GetAlignedSize(elem_cnt * sizeof(uint16_t));
-        int64_t sorted_indices_aligned_bytes = indices_aligned_bytes;
-        int64_t temp_storage_bytes = InferTempStorageForSortPairsDescending<uint16_t, uint16_t>(instance_size, instance_num);
-        GLOBAL_WORKSPACE_SIZE = GetAlignedSize(sorted_in_aligned_bytes + indices_aligned_bytes + sorted_indices_aligned_bytes + temp_storage_bytes);
-        cudaMalloc(&d_grouptopk_workspace, GLOBAL_WORKSPACE_SIZE * sizeof(uint8_t)); // 1*1031799296=1GB
-    }
+    d_dict8 = (uint8_t*)d_dict16; // 显存复用
+    d_grouptopk_workspace = (uint8_t*)d_docs_T; // 显存复用
     h2 = std::chrono::high_resolution_clock::now();
     int newDT = std::chrono::duration_cast<std::chrono::milliseconds>(h2 - h1).count();
 
@@ -467,77 +452,12 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
 
 
 
-    /////////////////////////////////////////////////////////////////////////////////////////////////
-    double b32T = 0;
-    kernelT = 0;
-    topkT = 0;
-    start_pos = cur_pos;
-    h1 = std::chrono::high_resolution_clock::now();
-    for (; cur_pos+32 < querys.size(); cur_pos+=32) {
-        tt1 = std::chrono::high_resolution_clock::now();
-
-        memset(h_dict32, 0, sizeof(uint32_t) * 50000);
-        for(int i = 0; i < 32; i++) {
-            for(int j = 0; j < querys[cur_pos+i].size(); j++)
-                h_dict32[querys[cur_pos+i][j]] |= 1<<i;
-            h_query_lens[i] = querys[cur_pos+i].size();
-        }
-        cudaMemcpyAsync(d_dict32, h_dict32, sizeof(uint32_t) * 50000, cudaMemcpyHostToDevice, streamA);
-        cudaMemcpyAsync(d_query_lens, h_query_lens, sizeof(uint16_t) * 32, cudaMemcpyHostToDevice, streamA);
-        docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint32_t,32><<<grid, block, 0, streamA>>>(
-            d_docs, d_doc_lens, n_docs, 
-            d_query_lens, 
-            d_scores, d_dict32);
-        cudaStreamSynchronize(streamA);
-
-        tt2 = std::chrono::high_resolution_clock::now();
-
-        for (int b = 0; b < 2; b++) {
-            topk_launcher<uint16_t>(
-                streamB,
-                n_docs*16,           // elem_cnt
-                grouptopk_size,     // instance_size
-                grouptopk_batch*16,  // instance_num
-                TOPK,               // top_k
-                d_scores+b*16*n_docs,
-                d_grouptopk_workspace,
-                h_grouptopk_idx,
-                h_grouptopk_val);
-            cudaStreamSynchronize(streamB);
-
-            for(int bb = 0; bb < 16; bb++) {
-                std::vector<int> top(grouptopk_batch,0);
-                for (int i = 0; i < TOPK; i++) {
-                    int idx = -1;
-                    int16_t val = -1;
-                    for (int j = 0; j < grouptopk_batch; j++) {
-                        if (h_grouptopk_val[bb*TOPK*grouptopk_batch+j*TOPK+top[j]] > val) {
-                            val = h_grouptopk_val[bb*TOPK*grouptopk_batch+j*TOPK+top[j]];
-                            idx = h_grouptopk_idx[bb*TOPK*grouptopk_batch+j*TOPK+top[j]] + j*grouptopk_size;
-                        }
-                    }
-                    indices[cur_pos+b*16+bb][i] = idx;
-                    top[idx/grouptopk_size]++;
-                }
-            }
-        }
-
-        tt3 = std::chrono::high_resolution_clock::now();
-        kernelT += std::chrono::duration_cast<std::chrono::microseconds>(tt2-tt1).count();
-        topkT += std::chrono::duration_cast<std::chrono::microseconds>(tt3-tt2).count();
-    }
-    h2 = std::chrono::high_resolution_clock::now();
-    if (cur_pos-start_pos > 0) {
-        b32T = (double)std::chrono::duration_cast<std::chrono::microseconds>(h2 - h1).count() / (cur_pos-start_pos);
-        kernelT /= (cur_pos-start_pos);
-        topkT /= (cur_pos-start_pos);
-    }
-    printf("[TIME] [B32] num:%ld, kernel:%ldus, topk:%ldus\n",cur_pos-start_pos,kernelT,topkT);
 
 
 
 
-    /////////////////////////////////////////////////////////////////////////////////////////////////
+
+
     double b16T = 0;
     kernelT = 0;
     topkT = 0;
@@ -552,8 +472,8 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
                 h_dict16[querys[cur_pos+i][j]] |= 1<<i;
             h_query_lens[i] = querys[cur_pos+i].size();
         }
-        cudaMemcpyAsync(d_dict16, h_dict16, sizeof(uint16_t) * 50000, cudaMemcpyHostToDevice, streamA);
-        cudaMemcpyAsync(d_query_lens, h_query_lens, sizeof(uint16_t) * 16, cudaMemcpyHostToDevice, streamA);
+        cudaMemcpy(d_dict16, h_dict16, sizeof(uint16_t) * 50000, cudaMemcpyHostToDevice);
+        cudaMemcpy(d_query_lens, h_query_lens, sizeof(uint16_t) * 16, cudaMemcpyHostToDevice);
         docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint16_t,16><<<grid, block, 0, streamA>>>(
             d_docs, d_doc_lens, n_docs, 
             d_query_lens, 
@@ -607,8 +527,6 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
 
 
 
-
-    /////////////////////////////////////////////////////////////////////////////////////////////////
     double b8T = 0;
     kernelT = 0;
     topkT = 0;
@@ -623,8 +541,8 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
                 h_dict8[querys[cur_pos+i][j]] |= 1<<i;
             h_query_lens[i] = querys[cur_pos+i].size();
         }
-        cudaMemcpyAsync(d_dict8, h_dict8, sizeof(uint8_t) * 50000, cudaMemcpyHostToDevice, streamA);
-        cudaMemcpyAsync(d_query_lens, h_query_lens, sizeof(uint16_t) * 8, cudaMemcpyHostToDevice, streamA);
+        cudaMemcpy(d_dict8, h_dict8, sizeof(uint8_t) * 50000, cudaMemcpyHostToDevice);
+        cudaMemcpy(d_query_lens, h_query_lens, sizeof(uint16_t) * 8, cudaMemcpyHostToDevice);
         docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,8><<<grid, block, 0, streamA>>>(
             d_docs, d_doc_lens, n_docs, 
             d_query_lens, 
@@ -676,7 +594,7 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
 
 
 
-    /////////////////////////////////////////////////////////////////////////////////////////////////
+
     double b1T = 0;
     h1 = std::chrono::high_resolution_clock::now();
     if (cur_pos < querys.size()) {
@@ -694,22 +612,22 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
                 h_dict8[querys[cur_pos+i][j]] |= 1<<i;
             h_query_lens[i] = querys[cur_pos+i].size();
         }
-        cudaMemcpyAsync(d_dict8, h_dict8, sizeof(uint8_t) * 50000, cudaMemcpyHostToDevice, streamA);
-        cudaMemcpyAsync(d_query_lens, h_query_lens, sizeof(uint16_t) * remain, cudaMemcpyHostToDevice, streamA);
-        switch(remain) {
-            case 1: docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,1><<<grid, block, 0, streamA>>>(d_docs, d_doc_lens, n_docs, d_query_lens, d_scores, d_dict8); break;
-            case 2: docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,2><<<grid, block, 0, streamA>>>(d_docs, d_doc_lens, n_docs, d_query_lens, d_scores, d_dict8); break;
-            case 3: docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,3><<<grid, block, 0, streamA>>>(d_docs, d_doc_lens, n_docs, d_query_lens, d_scores, d_dict8); break;
-            case 4: docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,4><<<grid, block, 0, streamA>>>(d_docs, d_doc_lens, n_docs, d_query_lens, d_scores, d_dict8); break;
-            case 5: docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,5><<<grid, block, 0, streamA>>>(d_docs, d_doc_lens, n_docs, d_query_lens, d_scores, d_dict8); break;
-            case 6: docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,6><<<grid, block, 0, streamA>>>(d_docs, d_doc_lens, n_docs, d_query_lens, d_scores, d_dict8); break;
-            case 7: docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,7><<<grid, block, 0, streamA>>>(d_docs, d_doc_lens, n_docs, d_query_lens, d_scores, d_dict8); break;
-            default: break;
-        }
-        // docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,8><<<grid, block, 0, streamA>>>(
-        //     d_docs, d_doc_lens, n_docs, 
-        //     d_query_lens, 
-        //     d_scores, d_dict8);
+        cudaMemcpy(d_dict8, h_dict8, sizeof(uint8_t) * 50000, cudaMemcpyHostToDevice);
+        cudaMemcpy(d_query_lens, h_query_lens, sizeof(uint16_t) * remain, cudaMemcpyHostToDevice);
+        // switch(remain) {
+        //     case 1: docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,1><<<grid, block, 0, streamA>>>(d_docs, d_doc_lens, n_docs, d_query_lens, d_scores, d_dict8); break;
+        //     case 2: docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,2><<<grid, block, 0, streamA>>>(d_docs, d_doc_lens, n_docs, d_query_lens, d_scores, d_dict8); break;
+        //     case 3: docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,3><<<grid, block, 0, streamA>>>(d_docs, d_doc_lens, n_docs, d_query_lens, d_scores, d_dict8); break;
+        //     case 4: docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,4><<<grid, block, 0, streamA>>>(d_docs, d_doc_lens, n_docs, d_query_lens, d_scores, d_dict8); break;
+        //     case 5: docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,5><<<grid, block, 0, streamA>>>(d_docs, d_doc_lens, n_docs, d_query_lens, d_scores, d_dict8); break;
+        //     case 6: docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,6><<<grid, block, 0, streamA>>>(d_docs, d_doc_lens, n_docs, d_query_lens, d_scores, d_dict8); break;
+        //     case 7: docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,7><<<grid, block, 0, streamA>>>(d_docs, d_doc_lens, n_docs, d_query_lens, d_scores, d_dict8); break;
+        //     default: break;
+        // }
+        docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,8><<<grid, block, 0, streamA>>>(
+            d_docs, d_doc_lens, n_docs, 
+            d_query_lens, 
+            d_scores, d_dict8);
         cudaStreamSynchronize(streamA);
 
         tt2 = std::chrono::high_resolution_clock::now();
@@ -764,7 +682,6 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
     printf("[TIME] read&transfer : %ldms\n",rtT);
     printf("[TIME] convert : %ldms\n",cT);
     printf("\n");
-    printf("[TIME] Batch32:%.4lfms\n",b32T/1000);
     printf("[TIME] Batch16:%.4lfms\n",b16T/1000);
     printf("[TIME] Batch8 :%.4lfms\n",b8T/1000);
     printf("[TIME] Batch1 :%.4lfms\n",b1T/1000);  
