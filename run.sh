@@ -18,7 +18,7 @@ if [ -z "$output_file" ]; then
 fi
 
 if [ -z "$query_dir" ]; then
-        query_dir=./translate/querys
+        query_dir=./translate/batch_querys
 fi
 
 
