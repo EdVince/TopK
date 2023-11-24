@@ -614,16 +614,6 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
         }
         cudaMemcpy(d_dict8, h_dict8, sizeof(uint8_t) * 50000, cudaMemcpyHostToDevice);
         cudaMemcpy(d_query_lens, h_query_lens, sizeof(uint16_t) * remain, cudaMemcpyHostToDevice);
-        // switch(remain) {
-        //     case 1: docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,1><<<grid, block, 0, streamA>>>(d_docs, d_doc_lens, n_docs, d_query_lens, d_scores, d_dict8); break;
-        //     case 2: docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,2><<<grid, block, 0, streamA>>>(d_docs, d_doc_lens, n_docs, d_query_lens, d_scores, d_dict8); break;
-        //     case 3: docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,3><<<grid, block, 0, streamA>>>(d_docs, d_doc_lens, n_docs, d_query_lens, d_scores, d_dict8); break;
-        //     case 4: docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,4><<<grid, block, 0, streamA>>>(d_docs, d_doc_lens, n_docs, d_query_lens, d_scores, d_dict8); break;
-        //     case 5: docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,5><<<grid, block, 0, streamA>>>(d_docs, d_doc_lens, n_docs, d_query_lens, d_scores, d_dict8); break;
-        //     case 6: docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,6><<<grid, block, 0, streamA>>>(d_docs, d_doc_lens, n_docs, d_query_lens, d_scores, d_dict8); break;
-        //     case 7: docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,7><<<grid, block, 0, streamA>>>(d_docs, d_doc_lens, n_docs, d_query_lens, d_scores, d_dict8); break;
-        //     default: break;
-        // }
         docQueryScoringCoalescedMemoryAccessSampleKernelBatchN<uint8_t,8><<<grid, block, 0, streamA>>>(
             d_docs, d_doc_lens, n_docs, 
             d_query_lens, 
