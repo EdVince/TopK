@@ -1,5 +1,9 @@
 # TopK
 
+比赛基于向量交集的TopK搜索
+
+第一名的方案：https://github.com/xiatwhu/baidu_topk
+
 ## 技巧
 1. 用```nsys profile bash run.sh```做完整pipeline的性能profile分析瓶颈
 2. 用```sudo /usr/local/cuda-11.8/nsight-compute-2022.3.0/nv-nsight-cu-cli --set detailed -o kernel ./bin/query_doc_scoring translate/docs.txt translate/querys translate/res/result.txt```做kernel profile分别瓶颈
